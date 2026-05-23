@@ -1,0 +1,6 @@
+httpx
+rich
+prompt_toolkit
+click
+pygments
+pathspec

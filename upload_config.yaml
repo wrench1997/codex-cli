@@ -1,0 +1,4 @@
+output_file: selected_code.txt
+include:
+  - ./*.py
+  - ./*.jinja

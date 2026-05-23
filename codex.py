@@ -1,0 +1,1216 @@
+# codex.py - 完整重写
+#!/usr/bin/env python3
+"""
+Codex CLI - Chat + Agent 持续对话模式
+支持多轮上下文保留的 AI 聊天，以及自动工具调用。
+
+用法:
+    python codex.py                          # 交互式 REPL（默认）
+    python codex.py "帮我重构 main.py"        # 单次任务后进入 REPL
+    python codex.py -y "修复所有 TODO"        # 自动审批模式
+    python codex.py --dir /path/to/project   # 指定工作目录
+    python codex.py --no-agent               # 纯聊天模式（不加载工具）
+"""
+
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from typing import Any, AsyncIterator, Optional
+
+import click
+import httpx
+from prompt_toolkit import PromptSession
+from prompt_toolkit.clipboard.base import Clipboard, ClipboardData
+from prompt_toolkit.filters import has_selection
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.shortcuts import print_formatted_text
+from prompt_toolkit.styles import Style
+from rich import box
+from rich.columns import Columns
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.syntax import Syntax
+from rich.text import Text
+
+from config import CONFIG
+from file_editor import list_directory, read_file
+from tools import TOOLS, ToolExecutor
+
+# ──────────────────────────────────────────────
+# 全局 Console
+# ──────────────────────────────────────────────
+console = Console()
+
+# ──────────────────────────────────────────────
+# 兼容性：UTF-8 + 控制字符清理
+# ──────────────────────────────────────────────
+
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CTRL_RE = re.compile(r"[\r\b\x0c\x0e-\x1f\x7f]")
+
+MAX_VISIBLE_STREAM_CHARS = 5000
+MAX_PANEL_CHARS = 8000
+
+def _sanitize_stream_text(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    return CTRL_RE.sub("", text)
+
+
+def _char_width(ch: str) -> int:
+    """
+    估算终端显示宽度：
+    - 中文 / 全角 / 大多数字符表情：2
+    - 普通 ASCII：1
+    - 组合附加符：0
+    """
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("F", "W", "A"):
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_char_width(ch) for ch in text)
+
+
+def _slice_by_display_width(text: str, max_width: int) -> str:
+    out = []
+    width = 0
+    for ch in text:
+        w = _char_width(ch)
+        if width + w > max_width:
+            break
+        out.append(ch)
+        width += w
+    return "".join(out)
+
+
+def compact_text(text: str, limit: int = MAX_PANEL_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit // 2
+    return (
+        f"（内容过长，已折叠，总长度 {len(text):,} 字符）\n\n"
+        f"{text[:head]}\n\n"
+        f"... 省略中间内容 ...\n\n"
+        f"{text[-tail:]}"
+    )
+
+def _panel(renderable, **kwargs):
+    kwargs.setdefault("box", box.ASCII)
+    return Panel(renderable, **kwargs)
+
+# ──────────────────────────────────────────────
+# Prompt Toolkit 样式
+# ──────────────────────────────────────────────
+PT_STYLE = Style.from_dict({
+    "prompt":       "bold #00d7ff",
+    "prompt.arrow": "bold #00d7ff",
+    "":             "#cccccc",
+})
+
+HISTORY_FILE = os.path.expanduser("~/.codex_chat_history")
+
+
+def _is_cmder() -> bool:
+    return bool(
+        os.environ.get("CMDER_ROOT")
+        or os.environ.get("ConEmuPID")
+        or os.environ.get("ConEmuANSI")
+    )
+
+
+IS_CMDER = _is_cmder()
+
+
+def _copy_to_system_clipboard(text: str) -> None:
+    """尽量把文本写入系统剪贴板。"""
+    if not text:
+        return
+
+    # 优先 pyperclip（如果你装了）
+    try:
+        import pyperclip  # type: ignore
+        pyperclip.copy(text)
+        return
+    except Exception:
+        pass
+
+    # 兜底：tkinter
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+        root.destroy()
+        return
+    except Exception:
+        pass
+
+
+def _read_from_system_clipboard() -> str:
+    """尽量从系统剪贴板读取文本。"""
+    try:
+        import pyperclip  # type: ignore
+        return pyperclip.paste() or ""
+    except Exception:
+        pass
+
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        try:
+            return root.clipboard_get() or ""
+        finally:
+            root.destroy()
+    except Exception:
+        return ""
+
+
+class SystemClipboard(Clipboard):
+    """prompt_toolkit 剪贴板后端，连接系统剪贴板。"""
+
+    def __init__(self):
+        self._cache = ""
+
+    def set_data(self, data: ClipboardData) -> None:
+        text = data.text or ""
+        self._cache = text
+        _copy_to_system_clipboard(text)
+
+    def get_data(self) -> ClipboardData:
+        text = _read_from_system_clipboard()
+        if not text:
+            text = self._cache
+        else:
+            self._cache = text
+        return ClipboardData(text=text)
+
+
+SYSTEM_CLIPBOARD = SystemClipboard()
+
+# ──────────────────────────────────────────────
+# 正则
+# ──────────────────────────────────────────────
+THINK_RE = re.compile(r".*?", re.S)
+TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=(?P<name>[^>]+)>\s*(?P<body>.*?)</function>\s*</tool_call>",
+    re.S,
+)
+PARAM_RE = re.compile(r"<parameter=(?P<name>[^>]+)>\s*(?P<value>.*?)</parameter>", re.S)
+
+
+def _strip_think(text: str) -> str:
+    return THINK_RE.sub("", text).strip()
+
+
+def _safe_emit(accumulated: str) -> str:
+    """
+    流式安全文本提取：去掉 think 块，屏蔽未闭合的 <think>/<tool_call> 残缺片段。
+    """
+    text = THINK_RE.sub("", accumulated)
+
+    # 屏蔽未闭合的 <think>
+    idx = text.rfind("<think>")
+    if idx != -1 and "</think>" not in text[idx:]:
+        text = text[:idx]
+
+    # 屏蔽 <tool_call> 及之后的全部内容
+    tool_idx = text.find("<tool_call")
+    if tool_idx != -1:
+        text = text[:tool_idx]
+
+    # 屏蔽末尾截断的标签片段
+    partials = [
+        "<tool_call", "<tool_cal", "<tool_ca", "<tool_c", "<tool_",
+        "<tool", "<too", "<to", "<t",
+        "<think", "<thin", "<thi", "<th",
+    ]
+    for p in partials:
+        if text.endswith(p):
+            text = text[:-len(p)]
+            break
+
+    return text
+
+
+def _normalize_api_base(api_base: str) -> str:
+    base = (api_base or "").rstrip("/")
+    for suffix in ("/v1/responses", "/v1/chat/completions", "/responses", "/chat/completions"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return base
+
+
+def _parse_tool_call(text: str) -> Optional[dict]:
+    m = TOOL_CALL_RE.search(text)
+    if not m:
+        return None
+    name = m.group("name").strip()
+    body = m.group("body")
+    args: dict[str, Any] = {}
+    for p in PARAM_RE.finditer(body):
+        raw = p.group("value").strip()
+        try:
+            args[p.group("name").strip()] = json.loads(raw)
+        except json.JSONDecodeError:
+            args[p.group("name").strip()] = raw
+    return {"name": name, "arguments": args}
+
+
+def _build_xml_tool_call(name: str, arguments: dict) -> str:
+    parts = [f"<tool_call>\n<function={name}>"]
+    for k, v in arguments.items():
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v, ensure_ascii=False)
+        parts.append(f"<parameter={k}>\n{v}\n</parameter>")
+    parts.append("</function>\n</tool_call>")
+    return "\n".join(parts)
+
+
+def _extract_function_call(item: dict) -> tuple[str, dict[str, Any], Optional[str]]:
+    name = item.get("name")
+    if not name and isinstance(item.get("function"), dict):
+        name = item["function"].get("name")
+
+    raw_args = item.get("arguments", "{}")
+    if not raw_args and isinstance(item.get("function"), dict):
+        raw_args = item["function"].get("arguments", "{}")
+
+    call_id = item.get("call_id") or item.get("id")
+
+    if isinstance(raw_args, str):
+        try:
+            args = json.loads(raw_args) if raw_args.strip() else {}
+        except json.JSONDecodeError:
+            args = {}
+    elif isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        args = {}
+
+    return name or "", args, call_id
+
+
+# ──────────────────────────────────────────────
+# UI 工具函数
+# ──────────────────────────────────────────────
+
+BANNER = """
++--------------------------------------------------+
+| Codex Chat - AI Coding Assistant                 |
+| 持续对话 · 上下文记忆 · 工具调用                 |
+| /help 查看命令   Ctrl+D 退出                     |
++--------------------------------------------------+
+"""
+
+HELP_TEXT = """
+## 可用命令
+
+| 命令 | 说明 |
+|------|------|
+| `/help`         | 显示此帮助 |
+| `/reset`        | 清空对话历史（保留系统提示） |
+| `/history`      | 查看对话历史摘要 |
+| `/ls [path]`    | 列出目录结构 |
+| `/cat <file>`   | 查看文件内容 |
+| `/cd <dir>`     | 切换工作目录 |
+| `/approve`      | 切换自动审批模式 |
+| `/model`        | 显示当前模型和配置 |
+| `/tokens`       | 估算当前上下文 token 数 |
+| `/mode`         | 切换 chat/agent 模式 |
+| `/exit`         | 退出 |
+
+## 输入技巧
+
+- **多行输入**: 按 `Esc+Enter` 换行，`Enter` 发送
+- **粘贴多行**: 按 `Ctrl+V` 粘贴剪贴板内容（支持多行）
+- **历史**: 上下箭头翻历史
+- **取消生成**: `Ctrl+C`
+
+## 模式说明
+
+- **agent 模式**（默认）: AI 可以读写文件、执行命令
+- **chat 模式**: 纯对话，不调用工具，适合讨论思路
+"""
+
+
+def print_separator(title: str = "", style: str = "dim"):
+    if title:
+        console.print(f"\n--- {title} ---", style=style)
+    else:
+        console.print("\n" + "-" * 80, style=style)
+
+
+def print_user_bubble(text: str):
+    """显示用户消息气泡。"""
+    console.print()
+    console.print(_panel(
+        Text(text, style="white"),
+        title="You",
+        title_align="right",
+        border_style="#00d7ff",
+        padding=(0, 1),
+    ))
+
+
+def print_tool_call_panel(name: str, args: dict):
+    """显示工具调用卡片。"""
+    args_lines = []
+    for k, v in args.items():
+        v_str = repr(v) if not isinstance(v, str) else v
+        v_str = _sanitize_stream_text(v_str)
+        if len(v_str) > 120:
+            v_str = v_str[:117] + "..."
+        args_lines.append(f"  {k} = {v_str}")
+    body = "\n".join(args_lines) if args_lines else "  (no args)"
+    console.print(_panel(
+        body,
+        title=f"Tool: {name}",
+        border_style="yellow",
+        padding=(0, 1),
+    ))
+
+
+def print_tool_result_panel(name: str, success: bool, output: str):
+    """显示工具结果卡片。"""
+    icon = "SUCCESS" if success else "FAILED"
+    border = "green" if success else "red"
+    output = compact_text(output)
+
+    # 检测是否含 diff
+    if "@@" in output and ("---" in output or "+++" in output):
+        lines = output.split("\n")
+        pre = []
+        diff_lines = []
+        in_diff = False
+        for line in lines:
+            if not in_diff and (line.startswith("---") or line.startswith("@@")):
+                in_diff = True
+            (diff_lines if in_diff else pre).append(line)
+
+        if pre:
+            console.print(_panel(
+                "\n".join(pre),
+                title=f"{icon}: {name}",
+                border_style=border,
+                padding=(0, 1),
+            ))
+        if diff_lines:
+            syntax = Syntax(compact_text("\n".join(diff_lines)), "diff", theme="monokai")
+            console.print(_panel(syntax, title="Diff preview", border_style="yellow"))
+        return
+
+    # 截断过长输出
+    lines = output.splitlines()
+    if len(lines) > 50:
+        shown = (
+            "\n".join(lines[:25])
+            + f"\n\n[dim]... 省略 {len(lines) - 50} 行 ...[/dim]\n\n"
+            + "\n".join(lines[-25:])
+        )
+    else:
+        shown = output
+
+    console.print(_panel(
+        shown,
+        title=f"{icon}: {name}",
+        border_style=border,
+        padding=(0, 1),
+    ))
+
+
+def print_diff_panel(path_line: str, diff_text: str):
+    console.print(_panel(
+        Text(path_line, style="bold"),
+        title="Pending file",
+        border_style="yellow",
+    ))
+    if diff_text.strip():
+        syntax = Syntax(compact_text(diff_text), "diff", theme="monokai")
+        console.print(_panel(syntax, title="Diff preview", border_style="yellow"))
+
+
+async def ask_approval(path_line: str, diff_text: str) -> bool:
+    """交互式询问用户是否批准文件修改。"""
+    print_diff_panel(path_line, diff_text)
+    console.print(
+        "\n  [bold]是否应用此修改？[/bold] "
+        "[[green]y[/green]]es / [[red]n[/red]]o / [[yellow]a[/yellow]]ll(全部同意): ",
+        end="",
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        answer = await loop.run_in_executor(None, sys.stdin.readline)
+        answer = answer.strip().lower()
+        return answer in ("y", "yes", "a", "")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+# ──────────────────────────────────────────────
+# 流式输出渲染器
+# ──────────────────────────────────────────────
+
+class StreamRenderer:
+    """
+    管理 AI 回复的流式渲染。
+    重点优化：
+    - 批量输出，减少 prompt_toolkit 重绘频率
+    - cmder 下更稳
+    """
+
+    def __init__(
+        self,
+        max_visible_chars: int = MAX_VISIBLE_STREAM_CHARS,
+        flush_chars: int = 48 if not IS_CMDER else 96,
+        flush_interval: float = 0.03 if not IS_CMDER else 0.08,
+    ):
+        self._buf = []
+        self._started = False
+        self._visible_width = 0
+        self._total_len = 0
+        self._truncated = False
+        self._max_visible_chars = max_visible_chars
+
+        self._pending_text = ""
+        self._pending_width = 0
+        self._last_flush = time.monotonic()
+        self._flush_chars = flush_chars
+        self._flush_interval = flush_interval
+
+    def start(self):
+        if not self._started:
+            console.print()
+            console.print("[bold green]Codex[/bold green] ", end="")
+            self._started = True
+
+    def _flush_pending(self):
+        if not self._pending_text:
+            return
+
+        # 用 prompt_toolkit 友好的方式输出，避免和输入行抢光标
+        print_formatted_text(self._pending_text, end="")
+
+        self._buf.append(self._pending_text)
+        self._visible_width += self._pending_width
+
+        self._pending_text = ""
+        self._pending_width = 0
+        self._last_flush = time.monotonic()
+
+    def feed(self, token: str):
+        token = _sanitize_stream_text(token)
+        if not token:
+            return
+
+        self._total_len += len(token)
+
+        if not self._started:
+            self.start()
+
+        if self._truncated:
+            return
+
+        remain = self._max_visible_chars - (self._visible_width + self._pending_width)
+        if remain <= 0:
+            self._flush_pending()
+            self._truncated = True
+            console.print()
+            console.print(f"[dim]（输出过长，已折叠，总长度 {self._total_len:,} 字符）[/dim]")
+            return
+
+        chunk = _slice_by_display_width(token, remain)
+        if not chunk:
+            return
+
+        self._pending_text += chunk
+        self._pending_width += _display_width(chunk)
+
+        now = time.monotonic()
+        should_flush = (
+            "\n" in chunk
+            or len(self._pending_text) >= self._flush_chars
+            or (now - self._last_flush) >= self._flush_interval
+        )
+
+        if should_flush:
+            self._flush_pending()
+
+        if _display_width(token) > remain:
+            self._truncated = True
+            self._flush_pending()
+            console.print()
+            console.print(f"[dim]（输出过长，已折叠，总长度 {self._total_len:,} 字符）[/dim]")
+
+    def finish(self) -> str:
+        self._flush_pending()
+        if self._started:
+            console.print()
+        return "".join(self._buf).strip()
+
+    def reset(self):
+        self._buf = []
+        self._started = False
+        self._visible_width = 0
+        self._total_len = 0
+        self._truncated = False
+        self._pending_text = ""
+        self._pending_width = 0
+        self._last_flush = time.monotonic()
+
+
+# ──────────────────────────────────────────────
+# Chat Agent
+# ──────────────────────────────────────────────
+
+class ChatAgent:
+    """
+    持续对话的 Chat + Agent。
+    - 维护完整对话历史（input_items）
+    - 支持工具调用循环
+    - 支持 agent/chat 两种模式
+    """
+
+    def __init__(
+        self,
+        workdir: str,
+        auto_approve: bool = False,
+        api_base: Optional[str] = None,
+        model: Optional[str] = None,
+        agent_mode: bool = True,
+    ):
+        self.workdir = workdir
+        self.auto_approve = auto_approve
+        self.agent_mode = agent_mode
+        self.executor = ToolExecutor(workdir, auto_approve=auto_approve)
+
+        self.api_base = _normalize_api_base(api_base or CONFIG.api_base)
+        self.model = model or CONFIG.model
+
+        # 统计
+        self.turn_count = 0
+        self.tool_call_count = 0
+
+        # 系统提示
+        self._system_content = (
+            f"You are Codex, an expert AI coding assistant embedded in a developer's terminal. "
+            f"You have access to the user's codebase and can read, write, search, and modify files. "
+            f"You maintain context across the entire conversation. "
+            f"Always prefer minimal, targeted edits over full rewrites. "
+            f"Explain your reasoning and actions in Chinese. "
+            f"Be concise but thorough. "
+            f"When the user asks follow-up questions, refer to the previous context naturally. "
+            f"IMPORTANT: Your current working directory is: {workdir}. "
+            f"All file operations and shell commands should use this directory as the root. "
+            f"When executing shell commands, you do NOT need to specify the working directory - "
+            f"commands will automatically run in {workdir}."
+        )
+
+        self.system_item = {
+            "type": "message",
+            "role": "system",
+            "content": self._system_content,
+        }
+
+        # 完整对话历史（包含 system）
+        self.input_items: list[dict] = [self.system_item]
+
+    # ── 历史管理 ──────────────────────────────────────────
+
+    def reset(self):
+        """清空历史，保留 system 消息。"""
+        self.input_items = [self.system_item]
+        self.turn_count = 0
+        self.tool_call_count = 0
+
+    def add_user(self, text: str):
+        self.input_items.append({
+            "type": "message",
+            "role": "user",
+            "content": text,
+        })
+
+    def add_assistant(self, text: str):
+        self.input_items.append({
+            "type": "message",
+            "role": "assistant",
+            "content": text,
+        })
+
+    def add_tool_result(self, call_id: Optional[str], output: str):
+        self.input_items.append({
+            "type": "function_call_output",
+            "call_id": call_id or f"call_{int(time.time())}",
+            "output": output,
+        })
+
+    def history_summary(self) -> str:
+        """返回对话历史摘要。"""
+        lines = [f"共 {len(self.input_items)} 条消息，{self.turn_count} 轮对话，{self.tool_call_count} 次工具调用\n"]
+        for i, item in enumerate(self.input_items):
+            role = item.get("role", item.get("type", "?"))
+            content = item.get("content", item.get("output", ""))
+            if isinstance(content, str):
+                preview = content[:60].replace("\n", " ")
+            else:
+                preview = str(content)[:60]
+            lines.append(f"  [{i:02d}] {role:20s} {preview!r}")
+        return "\n".join(lines)
+
+    def estimate_tokens(self) -> int:
+        """粗略估算 token 数（按字符数/2 估算中文场景）。"""
+        total_chars = sum(
+            len(str(item.get("content", item.get("output", ""))))
+            for item in self.input_items
+        )
+        return total_chars // 2
+
+    # ── HTTP 流式调用 ──────────────────────────────────────
+
+    async def _stream_request(
+        self,
+        on_token: Any = None,   # async callback(str)
+    ) -> tuple[str, Optional[dict]]:
+        """
+        调用 gateway /v1/responses，流式接收。
+        返回 (visible_stream_text, final_response_dict)
+        """
+        payload = {
+            "model": self.model,
+            "input": self.input_items,
+            "stream": True,
+            "temperature": CONFIG.temperature,
+        }
+
+        if self.agent_mode:
+            payload["tools"] = TOOLS
+
+        headers = {}
+        if CONFIG.api_key and CONFIG.api_key != "dummy":
+            headers["Authorization"] = f"Bearer {CONFIG.api_key}"
+
+        stream_parts: list[str] = []
+        final_response: Optional[dict] = None
+
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.api_base}/responses",
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    resp.raise_for_status()
+
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            evt = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+
+                        etype = evt.get("type", "")
+
+                        if etype == "response.output_text.delta":
+                            delta = evt.get("delta", "")
+                            if delta:
+                                stream_parts.append(delta)
+                                if on_token:
+                                    await on_token(delta)
+
+                        elif etype == "response.failed":
+                            err = evt.get("error", "Unknown error")
+                            raise RuntimeError(
+                                json.dumps(err, ensure_ascii=False)
+                                if isinstance(err, dict) else str(err)
+                            )
+
+                        elif etype == "response.completed":
+                            final_response = evt.get("response")
+
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"HTTP {e.response.status_code}: {e.response.text[:200]}")
+
+        return "".join(stream_parts), final_response
+
+    # ── 核心 turn 逻辑 ────────────────────────────────────
+
+    async def run_turn(
+        self,
+        on_token: Any = None,         # async callback(str) - 流式 token
+        on_tool_call: Any = None,     # async callback(name, args)
+        on_tool_result: Any = None,   # async callback(name, success, output)
+        on_pending: Any = None,       # async callback(path_line, diff_text) -> bool
+    ) -> str:
+        """
+        执行一个完整的对话轮次。
+        - 支持多次工具调用循环
+        - 自动将工具结果追加进历史
+        - 返回最终文本回复
+        """
+        self.turn_count += 1
+
+        for _loop in range(CONFIG.max_turns):
+            # ── 流式调用模型 ──────────────────────────────
+            stream_text, final_response = await self._stream_request(on_token=on_token)
+            visible_text = _strip_think(stream_text)
+
+            # ── 解析工具调用 ──────────────────────────────
+            output_items = (final_response or {}).get("output", [])
+            tool_calls = [
+                item for item in output_items
+                if item.get("type") == "function_call"
+            ]
+
+            # 没有工具调用 → 这轮结束
+            if not tool_calls:
+                # 把 assistant 回复加入历史
+                self.add_assistant(visible_text)
+                return visible_text
+
+            # ── 有工具调用 ────────────────────────────────
+            # 先把 assistant 消息（含 XML 表示的工具调用）加入历史
+            xml_blocks = []
+            for item in tool_calls:
+                name, args, _cid = _extract_function_call(item)
+                xml_blocks.append(_build_xml_tool_call(name, args))
+
+            combined = visible_text.strip()
+            xml_str = "\n\n".join(xml_blocks)
+            if xml_str:
+                combined = f"{combined}\n\n{xml_str}" if combined else xml_str
+            self.add_assistant(combined)
+
+            # ── 逐个执行工具 ──────────────────────────────
+            for item in tool_calls:
+                name, args, call_id = _extract_function_call(item)
+                self.tool_call_count += 1
+
+                if on_tool_call:
+                    await on_tool_call(name, args)
+
+                success, output = self.executor.execute(name, args)
+
+                # 处理需要审批的写操作
+                if output.startswith("__PENDING_WRITE__"):
+                    lines_out = output.split("\n", 2)
+                    path_line = lines_out[1] if len(lines_out) > 1 else ""
+                    diff_text = lines_out[2] if len(lines_out) > 2 else ""
+
+                    approved = True
+                    if on_pending:
+                        approved = await on_pending(path_line, diff_text)
+
+                    if approved:
+                        old_auto = self.executor.auto_approve
+                        self.executor.auto_approve = True
+                        success, output = self.executor.execute(name, args)
+                        self.executor.auto_approve = old_auto
+                    else:
+                        output = "用户拒绝了此操作。"
+                        success = False
+
+                if on_tool_result:
+                    await on_tool_result(name, success, output)
+
+                # 把工具结果加入历史
+                self.add_tool_result(call_id, output)
+
+            # 继续循环，让模型根据工具结果继续思考
+            # 注意：on_token 不需要重置，下一轮会继续追加
+            # 但为了 UI 区分，在下一轮开始前不重新打印 "Codex:" 前缀
+            # （由调用方通过 on_token 控制）
+
+        return "（已达到最大工具调用轮次）"
+
+
+# ──────────────────────────────────────────────
+# 内置命令处理
+# ──────────────────────────────────────────────
+
+async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
+    """
+    处理 / 开头的内置命令。
+    返回 True 表示已处理，False 表示未识别。
+    """
+    parts = cmd.strip().split(maxsplit=1)
+    command = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if command == "/help":
+        console.print(Markdown(HELP_TEXT))
+        return True
+
+    if command == "/reset":
+        agent.reset()
+        console.print(Panel(
+            "对话历史已清空，开始全新对话。",
+            title="重置完成",
+            border_style="green",
+        ))
+        return True
+
+    if command == "/history":
+        console.print(Panel(
+            agent.history_summary(),
+            title="对话历史",
+            border_style="cyan",
+        ))
+        return True
+
+    if command == "/tokens":
+        tokens = agent.estimate_tokens()
+        console.print(Panel(
+            f"估算 token 数（中文场景）: [bold]{tokens:,}[/bold]\n"
+            f"历史消息条数: {len(agent.input_items)}\n"
+            f"对话轮次: {agent.turn_count}",
+            title="📊 上下文统计",
+            border_style="cyan",
+        ))
+        return True
+
+    if command in ("/exit", "/quit", "/q"):
+        console.print("\n[bold cyan] 再见！感谢使用 Codex Chat。[/bold cyan]\n")
+        sys.exit(0)
+
+    if command == "/ls":
+        path = os.path.join(agent.workdir, arg) if arg else agent.workdir
+        try:
+            tree = list_directory(path, depth=3)
+            console.print(Panel(tree, title=f" {path}", border_style="cyan"))
+        except Exception as e:
+            console.print(f"  error {e}", style="red")
+        return True
+
+    if command == "/cat":
+        if not arg:
+            console.print("  error 用法: /cat <文件路径>", style="red")
+            return True
+        try:
+            path = os.path.join(agent.workdir, arg)
+            content = read_file(path)
+            lines = content.splitlines()
+            numbered = "\n".join(f"{i+1:4d} │ {l}" for i, l in enumerate(lines))
+            syntax = Syntax(numbered, "text", theme="monokai", word_wrap=True)
+            console.print(Panel(syntax, title=f"📄 {arg} ({len(lines)} 行)"))
+        except FileNotFoundError as e:
+            console.print(f"  error {e}", style="red")
+        return True
+
+    if command == "/cd":
+        if not arg:
+            console.print(f"  当前目录: [cyan]{agent.workdir}[/cyan]")
+            return True
+        new_dir = os.path.abspath(os.path.join(agent.workdir, arg))
+        if os.path.isdir(new_dir):
+            agent.workdir = new_dir
+            agent.executor.workdir = new_dir
+            console.print(f"工作目录: [cyan]{new_dir}[/cyan]")
+        else:
+            console.print(f"目录不存在: {new_dir}", style="red")
+        return True
+
+    if command == "/approve":
+        agent.auto_approve = not agent.auto_approve
+        agent.executor.auto_approve = agent.auto_approve
+        status = "[green]开启[/green]" if agent.auto_approve else "[yellow]关闭[/yellow]"
+        console.print(f"自动审批: {status}")
+        return True
+
+    if command == "/mode":
+        if arg in ("agent", "chat"):
+            agent.agent_mode = arg == "agent"
+        mode_str = "[bold green]Agent[/bold green]（工具调用）" if agent.agent_mode else "[bold yellow]Chat[/bold yellow]（纯对话）"
+        console.print(f"当前模式: {mode_str}")
+        if not arg:
+            console.print("  提示: /mode agent 或 /mode chat 切换")
+        return True
+
+    if command == "/model":
+        console.print(Panel(
+            f"模型: [bold]{agent.model}[/bold]\n"
+            f"API:  [bold]{agent.api_base}[/bold]\n"
+            f"温度: [bold]{CONFIG.temperature}[/bold]\n"
+            f"最大轮次: [bold]{CONFIG.max_turns}[/bold]\n"
+            f"自动审批: [bold]{'开启' if agent.auto_approve else '关闭'}[/bold]\n"
+            f"模式: [bold]{'Agent' if agent.agent_mode else 'Chat'}[/bold]",
+            title="配置信息",
+            border_style="cyan",
+        ))
+        return True
+
+    return False
+
+
+# ──────────────────────────────────────────────
+# REPL 主循环
+# ──────────────────────────────────────────────
+
+async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
+    """
+    持续对话的 REPL 主循环。
+    支持多行输入（Esc+Enter 换行）和 Ctrl+V 粘贴多行。
+    """
+    # 配置 prompt_toolkit key bindings
+    # 默认 Enter 发送，Esc+Enter 换行（类似 ChatGPT web 界面）
+    kb = KeyBindings()
+
+    @kb.add("enter", filter=~has_selection)
+    def _submit(event):
+        """Enter 键提交消息。"""
+        event.current_buffer.validate_and_handle()
+
+    @kb.add("escape", "enter")
+    def _newline(event):
+        """Esc+Enter 换行。"""
+        event.current_buffer.insert_text("\n")
+
+    @kb.add("c-v")
+    def _paste(event):
+        """支持 Ctrl+V 粘贴多行文本。"""
+        data = event.app.clipboard.get_data()
+        event.current_buffer.paste_clipboard_data(data)
+
+    session = PromptSession(
+        history=FileHistory(HISTORY_FILE),
+        style=PT_STYLE,
+        key_bindings=kb,
+        multiline=True,           # 支持多行输入和粘贴
+        wrap_lines=True,
+        enable_history_search=True,
+        clipboard=SYSTEM_CLIPBOARD,  # 使用系统剪贴板
+    )
+
+    # 关键：让 prompt_toolkit 正确重绘 prompt，避免流式输出把输入行冲乱
+    with patch_stdout(raw=True):
+        # 打印欢迎界面
+        console.print(BANNER, style="bold cyan")
+        console.print(Panel(
+            f"工作目录: [cyan]{agent.workdir}[/cyan]\n"
+            f"模型:     [cyan]{agent.model}[/cyan]\n"
+            f"API:      [cyan]{agent.api_base}[/cyan]\n"
+            f"自动审批: {'[green]开启[/green]' if agent.auto_approve else '[yellow]关闭[/yellow]'}\n"
+            f"模式:     [cyan]{'Agent（工具调用）' if agent.agent_mode else 'Chat（纯对话）'}[/cyan]\n\n"
+            "[dim]Esc+Enter 换行  ·  Enter 发送  ·  /help 查看命令[/dim]",
+            border_style="dim",
+        ))
+        console.print()
+
+        # 如果有初始任务，先执行它
+        if initial_task:
+            await _process_message(session, agent, initial_task, from_arg=True)
+
+        # 主循环
+        while True:
+            try:
+                # 显示提示符
+                # 显示提示符 - 更清楚的视觉提示
+                prompt_text = ">>> " if agent.agent_mode else "chat> "
+                user_input = await session.prompt_async(prompt_text, style=PT_STYLE)
+            except KeyboardInterrupt:
+                console.print("\n  [dim](Ctrl+C - 使用 /exit 或 Ctrl+D 退出)[/dim]")
+                continue
+            except EOFError:
+                console.print("\n[bold cyan] 再见！[/bold cyan]\n")
+                break
+
+            user_input = user_input.strip()
+            if not user_input:
+                continue
+
+            # 内置命令
+            if user_input.startswith("/"):
+                handled = await handle_builtin(user_input, agent)
+                if not handled:
+                    console.print(
+                        "  [yellow] 未知命令，输入 /help 查看所有命令[/yellow]"
+                    )
+                continue
+
+            # AI 对话
+            await _process_message(session, agent, user_input)
+
+
+async def _process_message(
+    session: PromptSession,
+    agent: ChatAgent,
+    user_input: str,
+    from_arg: bool = False,
+):
+    """处理单条用户消息，驱动 Agent 完成回复。"""
+    # 显示用户消息
+    if not from_arg:
+        print_user_bubble(user_input)
+    else:
+        console.print(Panel(
+            user_input,
+            title="[bold #00d7ff]任务[/bold #00d7ff]",
+            border_style="#00d7ff",
+        ))
+
+    # 加入历史
+    agent.add_user(user_input)
+
+    # 流式渲染器
+    renderer = StreamRenderer()
+    # 标记是否在工具调用循环中（工具调用后不再重打前缀）
+    in_tool_loop = False
+
+    async def on_token(token: str):
+        nonlocal in_tool_loop
+        if in_tool_loop:
+            # 工具调用完成后，模型继续输出，重新开一个段落
+            renderer.feed(token)
+        else:
+            renderer.feed(token)
+
+    async def on_tool_call(name: str, args: dict):
+        nonlocal in_tool_loop
+        # 结束当前流式输出段
+        partial = renderer.finish()
+        renderer.reset()
+        in_tool_loop = True
+        # 打印工具调用卡片
+        console.print()
+        print_tool_call_panel(name, args)
+
+    async def on_tool_result(name: str, success: bool, output: str):
+        print_tool_result_panel(name, success, output)
+        # 工具结果后，模型继续生成，重启渲染器
+        renderer.reset()
+        renderer.start()
+
+    async def on_pending(path_line: str, diff_text: str) -> bool:
+        return await ask_approval(path_line, diff_text)
+
+    try:
+        final_text = await agent.run_turn(
+            on_token=on_token,
+            on_tool_call=on_tool_call,
+            on_tool_result=on_tool_result,
+            on_pending=on_pending,
+        )
+
+        # 结束流式输出
+        renderer.finish()
+        console.print()
+
+        # 打印统计
+        console.print(
+            f"  [dim]第 {agent.turn_count} 轮 · "
+            f"历史 {len(agent.input_items)} 条 · "
+            f"~{agent.estimate_tokens():,} tokens[/dim]"
+        )
+
+    except KeyboardInterrupt:
+        renderer.finish()
+        console.print()
+        console.print("  [yellow]  已中断生成（历史仍保留）[/yellow]")
+        # 注意：被中断的回复不加入历史，避免历史污染
+        # 移除最后加入的 user 消息
+        if agent.input_items and agent.input_items[-1].get("role") == "user":
+            # 检查是否是我们刚加的
+            last = agent.input_items[-1].get("content", "")
+            if last == user_input:
+                agent.input_items.pop()
+
+    except Exception as e:
+        renderer.finish()
+        console.print()
+        console.print(Panel(
+            f"[red]{e}[/red]",
+            title=" 错误",
+            border_style="red",
+        ))
+        # 同样移除污染的 user 消息
+        if agent.input_items and agent.input_items[-1].get("role") == "user":
+            last = agent.input_items[-1].get("content", "")
+            if last == user_input:
+                agent.input_items.pop()
+
+    console.print()
+
+
+# ──────────────────────────────────────────────
+# CLI 入口
+# ──────────────────────────────────────────────
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("task", nargs=-1)
+@click.option("--dir", "-d", "workdir", default=None,
+              help="工作目录（默认当前目录）")
+@click.option("--yes", "-y", "auto_approve", is_flag=True, default=False,
+              help="自动审批所有文件修改")
+@click.option("--model", "-m", default=None,
+              help="指定模型名称")
+@click.option("--api", default="http://127.0.0.1:8080/v1",
+              help="API 基地址（例如 http://127.0.0.1:8080/v1）")
+@click.option("--no-agent", "no_agent", is_flag=True, default=False,
+              help="纯聊天模式，不使用工具")
+@click.option("--temperature", "-t", default=None, type=float,
+              help="采样温度（默认 0.6）")
+def main(task, workdir, auto_approve, model, api, no_agent, temperature):
+    """
+    Codex Chat — 持续对话的 AI 编程助手
+
+    支持多轮上下文记忆、工具调用（读写文件、执行命令）。
+    不传 task 时进入交互式 REPL，传入 task 则先执行后继续对话。
+    """
+    # 更新配置
+    if model:
+        CONFIG.model = model
+    if api:
+        CONFIG.api_base = api
+    if temperature is not None:
+        CONFIG.temperature = temperature
+
+    workdir = os.path.abspath(workdir or os.getcwd())
+
+    agent = ChatAgent(
+        workdir=workdir,
+        auto_approve=auto_approve or CONFIG.auto_approve,
+        api_base=CONFIG.api_base,
+        model=CONFIG.model,
+        agent_mode=not no_agent,
+    )
+
+    # 如果有初始任务，传给 repl 先执行，然后继续对话
+    initial = " ".join(task) if task else None
+
+    asyncio.run(repl(agent, initial_task=initial))
+
+
+if __name__ == "__main__":
+    main()
