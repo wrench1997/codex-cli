@@ -208,6 +208,37 @@ TOOLS: list[dict] = [
 ]
 
 # ──────────────────────────────────────────────
+# 工具集列表函数
+# ──────────────────────────────────────────────
+
+def list_tools() -> str:
+    """返回格式化的工具集列表。"""
+    output = ["📦 可用工具集:\n", "=" * 50]
+    for tool in TOOLS:
+        func = tool["function"]
+        name = func["name"]
+        desc = func["description"]
+        params = func["parameters"]["properties"]
+        required = func["parameters"].get("required", [])
+        
+        output.append(f"\n🔧 {name}")
+        output.append(f"   描述：{desc}")
+        if params:
+            output.append("   参数:")
+            for param_name, param_info in params.items():
+                req_mark = "*" if param_name in required else " "
+                param_type = param_info.get("type", "any")
+                param_desc = param_info.get("description", "")
+                default = param_info.get("default", None)
+                default_str = f" (默认：{default})" if default is not None else ""
+                output.append(f"     [{req_mark}] {param_name} ({param_type}): {param_desc}{default_str}")
+    
+    output.append("\n" + "=" * 50)
+    output.append(f"共 {len(TOOLS)} 个工具")
+    return "\n".join(output)
+
+
+# ──────────────────────────────────────────────
 # 执行器
 # ──────────────────────────────────────────────
 

@@ -977,15 +977,24 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
         return True
 
     if command == "/model":
+            console.print(Panel(
+                f"模型：[bold]{agent.model}[/bold]\n"
+                f"API:  [bold]{agent.api_base}[/bold]\n"
+                f"温度：[bold]{CONFIG.temperature}[/bold]\n"
+                f"最大轮次：[bold]{CONFIG.max_turns}[/bold]\n"
+                f"自动审批：[bold]{'开启' if agent.auto_approve else '关闭'}[/bold]\n"
+                f"模式：[bold]{'Agent' if agent.agent_mode else 'Chat'}[/bold]",
+                title="配置信息",
+                border_style="cyan",
+            ))
+            return True
+
+    if command == "/tools":
+        from tools import list_tools
         console.print(Panel(
-            f"模型: [bold]{agent.model}[/bold]\n"
-            f"API:  [bold]{agent.api_base}[/bold]\n"
-            f"温度: [bold]{CONFIG.temperature}[/bold]\n"
-            f"最大轮次: [bold]{CONFIG.max_turns}[/bold]\n"
-            f"自动审批: [bold]{'开启' if agent.auto_approve else '关闭'}[/bold]\n"
-            f"模式: [bold]{'Agent' if agent.agent_mode else 'Chat'}[/bold]",
-            title="配置信息",
-            border_style="cyan",
+            list_tools(),
+            title="🛠️ 可用工具",
+            border_style="green",
         ))
         return True
 
