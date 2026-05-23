@@ -45,6 +45,8 @@ from config import CONFIG
 from file_editor import list_directory, read_file
 from tools import TOOLS, ToolExecutor
 
+
+    
 # ──────────────────────────────────────────────
 # 全局 Console
 # ──────────────────────────────────────────────
@@ -142,6 +144,22 @@ def _is_cmder() -> bool:
 
 IS_CMDER = _is_cmder()
 
+
+
+
+# 强制禁用 VT100 输出，使用传统的 Win32 API
+if sys.platform == "win32" and _is_cmder():
+    print("禁用VT100")
+    os.environ["PROMPT_TOOLKIT_NO_VT100"] = "1"
+    
+    
+
+# ==================== 新增以下几行 ====================
+if IS_CMDER:
+    # 强制让 prompt_toolkit 不使用 ConEmu 的 ANSI 注入器
+    # 这通常能解决 Cmder 下中文光标乱跳的问题
+    os.environ["PROMPT_TOOLKIT_NO_CONEMU_ANSI"] = "1"
+    
 
 def _copy_to_system_clipboard(text: str) -> None:
     """尽量把文本写入系统剪贴板。"""
@@ -1032,13 +1050,24 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
         if initial_task:
             await _process_message(session, agent, initial_task, from_arg=True)
 
-        # 主循环
+# 主循环
         while True:
             try:
                 # 显示提示符
-                # 显示提示符 - 更清楚的视觉提示
                 prompt_text = ">>> " if agent.agent_mode else "chat> "
-                user_input = await session.prompt_async(prompt_text, style=PT_STYLE)
+                
+                # ================= 核心修改区域 =================
+                if IS_CMDER:
+                    # 降级方案：在 Cmder 下放弃 prompt_toolkit，使用原生 input
+                    console.print(f"[bold #00d7ff]{prompt_text}[/bold #00d7ff]", end="")
+                    loop = asyncio.get_running_loop()
+                    # 规避阻塞，使用线程池运行原生 input
+                    user_input = await loop.run_in_executor(None, input)
+                else:
+                    # 正常方案：其他终端继续使用高级多行输入
+                    user_input = await session.prompt_async(prompt_text, style=PT_STYLE)
+                # ================================================
+                
             except KeyboardInterrupt:
                 console.print("\n  [dim](Ctrl+C - 使用 /exit 或 Ctrl+D 退出)[/dim]")
                 continue
