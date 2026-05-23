@@ -364,6 +364,7 @@ HELP_TEXT = """
 | `/model`        | 显示当前模型和配置 |
 | `/tokens`       | 估算当前上下文 token 数 |
 | `/mode`         | 切换 chat/agent 模式 |
+| `/tools`        | 显示可用工具列表 |
 | `/exit`         | 退出 |
 
 ## 输入技巧
