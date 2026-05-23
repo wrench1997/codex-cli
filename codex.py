@@ -21,6 +21,13 @@ import time
 import unicodedata
 from typing import Any, AsyncIterator, Optional
 
+# 用于 Esc 键取消生成的平台特定导入
+if sys.platform.startswith("win"):
+    import msvcrt
+else:
+    import termios
+    import tty
+
 import click
 import httpx
 from prompt_toolkit import PromptSession
@@ -717,6 +724,7 @@ class ChatAgent:
     async def _stream_request(
         self,
         on_token: Any = None,   # async callback(str)
+        cancel_event: Any = None,  # asyncio.Event - 用于取消生成
     ) -> tuple[str, Optional[dict]]:
         """
         调用 gateway /v1/responses，流式接收。
@@ -750,6 +758,10 @@ class ChatAgent:
                     resp.raise_for_status()
 
                     async for line in resp.aiter_lines():
+                        # 检查取消事件
+                        if cancel_event and cancel_event.is_set():
+                            raise asyncio.CancelledError("用户取消了生成")
+                        
                         if not line or not line.startswith("data:"):
                             continue
                         data = line[5:].strip()
@@ -792,6 +804,7 @@ class ChatAgent:
         on_tool_call: Any = None,     # async callback(name, args)
         on_tool_result: Any = None,   # async callback(name, success, output)
         on_pending: Any = None,       # async callback(path_line, diff_text) -> bool
+        cancel_event: Any = None,     # asyncio.Event - 用于取消生成
     ) -> str:
         """
         执行一个完整的对话轮次。
@@ -803,7 +816,7 @@ class ChatAgent:
 
         for _loop in range(CONFIG.max_turns):
             # ── 流式调用模型 ──────────────────────────────
-            stream_text, final_response = await self._stream_request(on_token=on_token)
+            stream_text, final_response = await self._stream_request(on_token=on_token, cancel_event=cancel_event)
             visible_text = _strip_think(stream_text)
 
             # ── 解析工具调用 ──────────────────────────────
@@ -1041,6 +1054,15 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
         clipboard=SYSTEM_CLIPBOARD,  # 使用系统剪贴板
     )
 
+    # 全局取消事件 - 用于在 AI 生成期间按 Esc 取消
+    cancel_event: Optional[asyncio.Event] = None
+
+    async def wait_for_cancel():
+        """等待取消事件，当用户按下 Esc 时触发。"""
+        nonlocal cancel_event
+        if cancel_event:
+            await cancel_event.wait()
+
     # 关键：让 prompt_toolkit 正确重绘 prompt，避免流式输出把输入行冲乱
     with patch_stdout(raw=True):
         # 打印欢迎界面
@@ -1051,7 +1073,7 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
             f"API:      [cyan]{agent.api_base}[/cyan]\n"
             f"自动审批: {'[green]开启[/green]' if agent.auto_approve else '[yellow]关闭[/yellow]'}\n"
             f"模式:     [cyan]{'Agent（工具调用）' if agent.agent_mode else 'Chat（纯对话）'}[/cyan]\n\n"
-            "[dim]Esc+Enter 换行  ·  Enter 发送  ·  /help 查看命令[/dim]",
+            "[dim]Esc+Enter 换行  ·  Enter 发送  ·  Esc 取消生成  ·  /help 查看命令[/dim]",
             border_style="dim",
         ))
         console.print()
@@ -1126,6 +1148,40 @@ async def _process_message(
     renderer = StreamRenderer()
     # 标记是否在工具调用循环中（工具调用后不再重打前缀）
     in_tool_loop = False
+    # 取消事件 - 用于 Esc 键取消生成
+    cancel_event = asyncio.Event()
+    # 标记是否正在生成
+    is_generating = True
+
+    async def listen_for_esc():
+        """后台监听 Esc 键，用户按下时触发取消事件。"""
+        nonlocal is_generating
+        if sys.platform.startswith("win"):
+            # Windows 平台
+            while is_generating:
+                if msvcrt.kbhit():
+                    key = msvcrt.getwch()
+                    if key == '\x1b' or key == '':  # Esc 键
+                        cancel_event.set()
+                        console.print("\n[yellow]  已取消生成[/yellow]")
+                        break
+                await asyncio.sleep(0.05)
+        else:
+            # Unix/Linux/Mac 平台
+            import select
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while is_generating:
+                    if sys.stdin in select.select([sys.stdin], [], [], 0.05)[0]:
+                        key = sys.stdin.read(1)
+                        if key == '\x1b':  # Esc 键
+                            cancel_event.set()
+                            console.print("\n[yellow]  已取消生成[/yellow]")
+                            break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     async def on_token(token: str):
         nonlocal in_tool_loop
@@ -1155,12 +1211,24 @@ async def _process_message(
         return await ask_approval(path_line, diff_text)
 
     try:
+        # 启动后台任务监听 Esc 键
+        esc_listener_task = asyncio.create_task(listen_for_esc())
+        
         final_text = await agent.run_turn(
             on_token=on_token,
             on_tool_call=on_tool_call,
             on_tool_result=on_tool_result,
             on_pending=on_pending,
+            cancel_event=cancel_event,
         )
+        
+        # 生成完成，停止监听
+        is_generating = False
+        esc_listener_task.cancel()
+        try:
+            await esc_listener_task
+        except asyncio.CancelledError:
+            pass
 
         # 结束流式输出
         renderer.finish()
@@ -1173,10 +1241,25 @@ async def _process_message(
             f"~{agent.estimate_tokens():,} tokens[/dim]"
         )
 
+    except asyncio.CancelledError:
+        # 用户按 Esc 取消了生成
+        renderer.finish()
+        console.print()
+        console.print("  [yellow]  已取消生成（历史仍保留）[/yellow]")
+        # 停止监听
+        is_generating = False
+        # 移除最后加入的 user 消息
+        if agent.input_items and agent.input_items[-1].get("role") == "user":
+            last = agent.input_items[-1].get("content", "")
+            if last == user_input:
+                agent.input_items.pop()
+
     except KeyboardInterrupt:
         renderer.finish()
         console.print()
         console.print("  [yellow]  已中断生成（历史仍保留）[/yellow]")
+        # 停止监听
+        is_generating = False
         # 注意：被中断的回复不加入历史，避免历史污染
         # 移除最后加入的 user 消息
         if agent.input_items and agent.input_items[-1].get("role") == "user":
@@ -1193,6 +1276,8 @@ async def _process_message(
             title=" 错误",
             border_style="red",
         ))
+        # 停止监听
+        is_generating = False
         # 同样移除污染的 user 消息
         if agent.input_items and agent.input_items[-1].get("role") == "user":
             last = agent.input_items[-1].get("content", "")

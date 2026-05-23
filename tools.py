@@ -385,12 +385,15 @@ class ToolExecutor:
 
         # ── search_in_files ────────────────────────────
         elif name == "search_in_files":
+            max_results = args.get("max_results", 50)
+            if isinstance(max_results, str):
+                max_results = int(max_results)
             hits = search_in_files(
                 args["pattern"],
                 directory=self._resolve(args.get("directory", ".")),
                 file_glob=args.get("file_glob", "**/*"),
                 regex=args.get("regex", False),
-                max_results=args.get("max_results", 50),
+                max_results=max_results,
             )
             if not hits:
                 return True, "🔍 未找到匹配结果。"
@@ -414,7 +417,7 @@ class ToolExecutor:
                 workdir = self._resolve(args["workdir"])
             else:
                 workdir = self.workdir
-            timeout = args.get("timeout", 60)
+            timeout = int(args.get("timeout", 60))
             cmd = args["command"]
             result = subprocess.run(
                 cmd,
