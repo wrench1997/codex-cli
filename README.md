@@ -195,7 +195,7 @@ python codex.py --no-agent
 
 ### 输入技巧
 
-- **多行输入**: 按 `Esc+Enter` 换行，`Enter` 发送
+- **多行输入**: 按 `Ctrl+Enter` 换行，`Enter` 发送
 - **粘贴多行**: 按 `Ctrl+V` 粘贴剪贴板内容
 - **历史**: 上下箭头翻阅历史
 - **取消生成**: `Ctrl+C`

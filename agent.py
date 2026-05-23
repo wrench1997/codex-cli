@@ -214,8 +214,9 @@ class Agent:
                 diff_text = lines[2] if len(lines) > 2 else ""
 
                 approved = True
+                reject_reason = None
                 if on_pending:
-                    approved = await on_pending(path_line, diff_text)
+                    approved, reject_reason = await on_pending(path_line, diff_text)
 
                 if approved:
                     # 实际执行写操作
@@ -223,7 +224,10 @@ class Agent:
                     success, output = self.executor.execute(name, args)
                     self.executor.auto_approve = self.auto_approve
                 else:
-                    output = "用户拒绝了此操作。"
+                    if reject_reason:
+                        output = f"用户拒绝了此操作，原因：{reject_reason}"
+                    else:
+                        output = "用户拒绝了此操作。"
                     success = False
 
             if on_tool_result:

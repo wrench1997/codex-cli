@@ -484,8 +484,10 @@ def print_diff_panel(path_line: str, diff_text: str):
         console.print(_panel(syntax, title="Diff preview", border_style="yellow"))
 
 
-async def ask_approval(path_line: str, diff_text: str) -> bool:
-    """交互式询问用户是否批准文件修改。"""
+async def ask_approval(path_line: str, diff_text: str) -> tuple[bool, Optional[str]]:
+    """交互式询问用户是否批准文件修改。
+    返回 (是否批准，拒绝原因)。
+    """
     print_diff_panel(path_line, diff_text)
     console.print(
         "\n  [bold]是否应用此修改？[/bold] "
@@ -496,9 +498,22 @@ async def ask_approval(path_line: str, diff_text: str) -> bool:
         loop = asyncio.get_running_loop()
         answer = await loop.run_in_executor(None, sys.stdin.readline)
         answer = answer.strip().lower()
-        return answer in ("y", "yes", "a", "")
+        
+        if answer in ("y", "yes", "a", ""):
+            return True, None
+        elif answer in ("n", "no"):
+            # 用户拒绝，询问原因
+            console.print(
+                "\n  [bold yellow]请输入拒绝原因（可选，直接回车跳过）：[/bold yellow] ",
+                end="",
+            )
+            reason = await loop.run_in_executor(None, sys.stdin.readline)
+            reason = reason.strip()
+            return False, reason if reason else None
+        else:
+            return True, None
     except (EOFError, KeyboardInterrupt):
-        return False
+        return False, None
 
 
 # ──────────────────────────────────────────────
@@ -803,7 +818,7 @@ class ChatAgent:
         on_token: Any = None,         # async callback(str) - 流式 token
         on_tool_call: Any = None,     # async callback(name, args)
         on_tool_result: Any = None,   # async callback(name, success, output)
-        on_pending: Any = None,       # async callback(path_line, diff_text) -> bool
+        on_pending: Any = None,       # async callback(path_line, diff_text) -> tuple[bool, Optional[str]]
         cancel_event: Any = None,     # asyncio.Event - 用于取消生成
     ) -> str:
         """
@@ -862,8 +877,9 @@ class ChatAgent:
                     diff_text = lines_out[2] if len(lines_out) > 2 else ""
 
                     approved = True
+                    reject_reason = None
                     if on_pending:
-                        approved = await on_pending(path_line, diff_text)
+                        approved, reject_reason = await on_pending(path_line, diff_text)
 
                     if approved:
                         old_auto = self.executor.auto_approve
@@ -871,7 +887,10 @@ class ChatAgent:
                         success, output = self.executor.execute(name, args)
                         self.executor.auto_approve = old_auto
                     else:
-                        output = "用户拒绝了此操作。"
+                        if reject_reason:
+                            output = f"用户拒绝了此操作，原因：{reject_reason}"
+                        else:
+                            output = "用户拒绝了此操作。"
                         success = False
 
                 if on_tool_result:
@@ -1035,7 +1054,7 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
 
     @kb.add("escape", "enter")
     def _newline(event):
-        """Esc+Enter 换行。"""
+        """escape-enter 换行。"""
         event.current_buffer.insert_text("\n")
 
     @kb.add("c-v")
@@ -1207,7 +1226,7 @@ async def _process_message(
         renderer.reset()
         renderer.start()
 
-    async def on_pending(path_line: str, diff_text: str) -> bool:
+    async def on_pending(path_line: str, diff_text: str) -> tuple[bool, Optional[str]]:
         return await ask_approval(path_line, diff_text)
 
     try:
