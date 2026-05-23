@@ -5,12 +5,13 @@
 """
 
 import difflib
+import fnmatch
 import os
 import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Set
 
 
 # ──────────────────────────────────────────────
@@ -248,25 +249,103 @@ def search_in_files(
     return results
 
 
-def list_directory(path: str = ".", depth: int = 2) -> str:
-    """返回目录树字符串。"""
-    lines = []
+def _load_gitignore_patterns(base_path: Path) -> List[str]:
+    """加载 .gitignore 中的忽略模式。"""
+    gitignore_path = base_path / ".gitignore"
+    patterns = []
+    if gitignore_path.exists():
+        with open(gitignore_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                # 跳过空行和注释
+                if not line or line.startswith("#"):
+                    continue
+                patterns.append(line)
+    return patterns
 
+
+def _should_ignore(entry: Path, base_path: Path, patterns: List[str]) -> bool:
+    """检查条目是否应该被忽略（根据 gitignore 模式）。"""
+    rel_path = entry.relative_to(base_path)
+    rel_str = str(rel_path).replace("\\", "/")
+    name = entry.name
+    
+    for pattern in patterns:
+        # 处理目录模式（以 / 结尾）
+        if pattern.endswith("/"):
+            pattern = pattern.rstrip("/")
+            if entry.is_dir() and (name == pattern or rel_str.endswith("/" + pattern)):
+                return True
+        # 处理路径模式（包含 / 但不以 / 结尾）
+        elif "/" in pattern:
+            # 处理 __pycache__/* 这种模式 - 忽略目录本身
+            if pattern.endswith("/*"):
+                dir_pattern = pattern[:-2]  # 去掉 /*
+                if entry.is_dir() and (name == dir_pattern or rel_str.endswith("/" + dir_pattern)):
+                    return True
+            if fnmatch.fnmatch(rel_str, pattern):
+                return True
+        # 简单模式：匹配文件名或目录名
+        else:
+            if fnmatch.fnmatch(name, pattern):
+                return True
+    
+    return False
+
+
+def list_directory(path: str = ".", depth: int = 2, max_entries_per_dir: int = 15) -> str:
+    """返回目录树字符串（优化版，减少 token 消耗）。
+    
+    Args:
+        path: 目录路径
+        depth: 递归深度，默认 2
+        max_entries_per_dir: 每层最大显示条目数，超过则显示摘要
+    """
+    lines = []
+    root = Path(path).resolve()
+    patterns = _load_gitignore_patterns(root)
+    
+    # 始终忽略的目录
+    ALWAYS_IGNORE = {'.git', 'node_modules'}
+    
     def _walk(current: Path, prefix: str, d: int):
         if d < 0:
             return
         try:
-            entries = sorted(current.iterdir(), key=lambda x: (x.is_file(), x.name))
+            entries = sorted(current.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
         except PermissionError:
             return
-        for i, entry in enumerate(entries):
-            connector = "└── " if i == len(entries) - 1 else "├── "
+        
+        # 过滤忽略的目录和文件
+        entries = [e for e in entries 
+                   if not (e.is_dir() and e.name in ALWAYS_IGNORE)
+                   and not _should_ignore(e, root, patterns)]
+        
+        total = len(entries)
+        if total > max_entries_per_dir:
+            # 优先显示目录，然后是文件
+            dirs = [e for e in entries if e.is_dir()]
+            files = [e for e in entries if e.is_file()]
+            # 截断
+            shown_dirs = dirs[:max_entries_per_dir // 2]
+            shown_files = files[:max_entries_per_dir - len(shown_dirs)]
+            shown = shown_dirs + shown_files
+            hidden_count = total - len(shown)
+        else:
+            shown = entries
+            hidden_count = 0
+        
+        for i, entry in enumerate(shown):
+            connector = "└── " if i == len(shown) - 1 and hidden_count == 0 else "├── "
             lines.append(f"{prefix}{connector}{entry.name}")
             if entry.is_dir() and d > 0:
-                extension = "    " if i == len(entries) - 1 else "│   "
+                extension = "    " if i == len(shown) - 1 and hidden_count == 0 else "│   "
                 _walk(entry, prefix + extension, d - 1)
+        
+        if hidden_count > 0:
+            lines.append(f"{prefix}    ... ({hidden_count} 个条目未显示)")
 
     root = Path(path)
-    lines.append(str(root.resolve()))
+    lines.append(f"{root.resolve()} (depth={depth})")
     _walk(root, "", depth)
     return "\n".join(lines)
