@@ -271,8 +271,20 @@ def search_in_files(
     files_searched = 0
     files_matched = 0
     
+    # 始终忽略的目录（与 list_directory 保持一致）
+    ALWAYS_IGNORE_DIRS = {'.git', 'node_modules', '.zig-cache', '__pycache__', '.venv', '.vscode'}
+    
     for p in Path(directory).glob(file_glob):
         if not p.is_file():
+            continue
+        
+        # 检查是否在始终忽略的目录中
+        should_skip = False
+        for part in p.relative_to(base_path).parts:
+            if part in ALWAYS_IGNORE_DIRS:
+                should_skip = True
+                break
+        if should_skip:
             continue
         
         # 检查排除模式
@@ -353,6 +365,11 @@ def _should_ignore(entry: Path, base_path: Path, patterns: List[str]) -> bool:
     rel_path = entry.relative_to(base_path)
     rel_str = str(rel_path).replace("\\", "/")
     name = entry.name
+    
+    # .gitignore 文件本身不应该被忽略（否则无法搜索其内容，但通常我们也不希望它出现在搜索结果中）
+    # 这里选择排除 .gitignore 本身，避免搜索时匹配到 ignore 规则
+    if name == ".gitignore":
+        return True
     
     for pattern in patterns:
         # 处理目录模式（以 / 结尾）
