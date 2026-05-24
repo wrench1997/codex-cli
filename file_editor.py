@@ -18,6 +18,9 @@ from typing import List, Optional, Set
 # 基础工具
 # ──────────────────────────────────────────────
 
+# 用于检测是否需要自动启用正则模式的特殊字符
+_REGEX_SPECIAL_CHARS = re.compile(r'[\\.^$*+?{}[\]|(){}]')
+
 def _read(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
@@ -220,38 +223,113 @@ def search_in_files(
     file_glob: str = "**/*",
     regex: bool = False,
     max_results: int = 200,
+    case_sensitive: bool = True,
+    context_lines: int = 0,
+    exclude_glob: str = "",
 ) -> list[dict]:
     """
     在目录中搜索文本，返回匹配列表。
-    每项: {file, line_no, line}
-    会自动读取 .gitignore 并排除忽略的文件和目录。
+    
+    Args:
+        pattern: 搜索模式（字符串或正则）
+        directory: 搜索目录
+        file_glob: 文件 glob 模式，默认 **/*
+        regex: 是否使用正则表达式。如果为 "auto" 或未指定，当检测到 pattern 包含正则特殊字符时自动启用
+        max_results: 最大结果数
+        case_sensitive: 是否区分大小写（默认区分）
+        context_lines: 上下文行数（前后各显示多少行）
+        exclude_glob: 排除的文件 glob 模式（如 *.log, **/test/**）
+    
+    Returns:
+        每项：{file, line_no, line, context_before, context_after, rel_path}
+        会自动读取 .gitignore 并排除忽略的文件和目录。
     """
     results = []
-    flags = re.MULTILINE
     base_path = Path(directory).resolve()
     patterns = _load_gitignore_patterns(base_path)
-
+    
+    # 自动检测是否需要正则模式：当 regex=False 但 pattern 包含正则特殊字符时自动启用
+    if regex == "auto" or (isinstance(regex, bool) and not regex and _REGEX_SPECIAL_CHARS.search(pattern)):
+        regex = True
+    
+    # 构建正则标志
+    flags = re.MULTILINE
+    if not case_sensitive:
+        flags |= re.IGNORECASE
+    
+    # 预编译正则表达式（如果是正则模式）
+    compiled_regex = None
+    if regex:
+        try:
+            compiled_regex = re.compile(pattern, flags=flags)
+        except re.error as e:
+            raise ValueError(f"无效的正则表达式 '{pattern}': {e}")
+    
+    # 解析排除模式
+    exclude_patterns = exclude_glob.split(",") if exclude_glob else []
+    
+    files_searched = 0
+    files_matched = 0
+    
     for p in Path(directory).glob(file_glob):
         if not p.is_file():
             continue
+        
+        # 检查排除模式
+        rel_str = str(p.relative_to(base_path)).replace("\\", "/")
+        excluded = False
+        for exc in exclude_patterns:
+            exc = exc.strip()
+            if exc and (fnmatch.fnmatch(rel_str, exc) or fnmatch.fnmatch(p.name, exc)):
+                excluded = True
+                break
+        if excluded:
+            continue
+        
         # 检查是否应该被 .gitignore 忽略
         if _should_ignore(p, base_path, patterns):
             continue
+        
         try:
             content = p.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-
-        for i, line in enumerate(content.splitlines(), 1):
+        
+        files_searched += 1
+        lines = content.splitlines()
+        file_matched = False
+        
+        for i, line in enumerate(lines, 1):
             matched = (
-                bool(re.search(pattern, line, flags=flags))
+                compiled_regex.search(line) is not None
                 if regex
-                else pattern in line
+                else (pattern in line if case_sensitive else pattern.lower() in line.lower())
             )
             if matched:
-                results.append({"file": str(p), "line_no": i, "line": line})
+                file_matched = True
+                # 获取上下文
+                ctx_before = lines[max(0, i-1-context_lines):i-1]
+                ctx_after = lines[i:min(len(lines), i+context_lines)]
+                
+                results.append({
+                    "file": str(p),
+                    "rel_path": rel_str,
+                    "line_no": i,
+                    "line": line,
+                    "context_before": ctx_before,
+                    "context_after": ctx_after,
+                })
                 if len(results) >= max_results:
-                    return results
+                    break
+        if file_matched:
+            files_matched += 1
+        if len(results) >= max_results:
+            break
+    
+    # 添加统计信息到结果（通过第一个元素的特殊字段）
+    if results:
+        results[0]["_stats"] = {"files_searched": files_searched, "files_matched": files_matched}
+    
     return results
 
 

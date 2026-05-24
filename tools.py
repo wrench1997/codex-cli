@@ -71,7 +71,7 @@ TOOLS: list[dict] = [
                     "search": {"type": "string", "description": "要搜索的文本（精确匹配或正则）"},
                     "replace": {"type": "string", "description": "替换成的文本"},
                     "count": {"type": "integer", "description": "最多替换次数，0=全部", "default": 0},
-                    "regex": {"type": "boolean", "description": "是否使用正则表达式", "default": False},
+                    "regex": {"type": ["boolean", "string"], "description": "是否使用正则表达式。默认 'auto' 会自动检测 pattern 中的正则特殊字符", "default": "auto", "enum": [true, false, "auto"]},
                 },
                 "required": ["path", "search", "replace"],
             },
@@ -141,19 +141,22 @@ TOOLS: list[dict] = [
             },
         },
     },
-    {
+{
         "type": "function",
         "function": {
             "name": "search_in_files",
-            "description": "在目录中全文搜索关键词，返回匹配的行。",
+            "description": "在目录中全文搜索关键词，返回匹配的行。支持正则、大小写控制、上下文显示和文件排除。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "搜索模式"},
+                    "pattern": {"type": "string", "description": "搜索模式（字符串或正则）"},
                     "directory": {"type": "string", "description": "搜索目录", "default": "."},
-                    "file_glob": {"type": "string", "description": "文件 glob，默认 **/*", "default": "**/*"},
-                    "regex": {"type": "boolean", "default": False},
-                    "max_results": {"type": "integer", "default": 50},
+                    "file_glob": {"type": "string", "description": "文件 glob 模式，默认 **/*", "default": "**/*"},
+                    "regex": {"type": ["boolean", "string"], "description": "是否使用正则表达式。默认 'auto' 会自动检测 pattern 中的正则特殊字符", "default": "auto", "enum": [true, false, "auto"]},
+                    "max_results": {"type": "integer", "description": "最大结果数", "default": 50},
+                    "case_sensitive": {"type": "boolean", "description": "是否区分大小写", "default": True},
+                    "context_lines": {"type": "integer", "description": "上下文行数（前后各显示多少行）", "default": 0},
+                    "exclude_glob": {"type": "string", "description": "排除的文件 glob 模式，逗号分隔（如 *.log, **/test/**）", "default": ""},
                 },
                 "required": ["pattern"],
             },
@@ -374,7 +377,7 @@ class ToolExecutor:
                 return True, f"__PENDING_WRITE__\n路径: {args['path']}\n\n{diff}"
             return True, f"✅ 行替换完成: {args['path']}\n\n{diff}"
 
-        # ── apply_patch ────────────────────────────────
+# ── apply_patch ────────────────────────────────
         elif name == "apply_patch":
             result = apply_patch(
                 args["patch_text"],
@@ -392,14 +395,44 @@ class ToolExecutor:
                 args["pattern"],
                 directory=self._resolve(args.get("directory", ".")),
                 file_glob=args.get("file_glob", "**/*"),
-                regex=args.get("regex", False),
+                regex=args.get("regex", "auto"),
                 max_results=max_results,
+                case_sensitive=args.get("case_sensitive", True),
+                context_lines=args.get("context_lines", 0),
+                exclude_glob=args.get("exclude_glob", ""),
             )
             if not hits:
                 return True, "🔍 未找到匹配结果。"
-            lines = [f"🔍 找到 {len(hits)} 处匹配:\n"]
+            
+            # 提取统计信息
+            stats = hits[0].pop("_stats", None) if hits else None
+            stats_str = f"\n\n📊 统计：搜索了 {stats['files_searched']} 个文件，{stats['files_matched']} 个文件包含匹配项" if stats else ""
+            
+            lines = [f"🔍 找到 {len(hits)} 处匹配:{stats_str}\n"]
             for h in hits:
-                lines.append(f"  {h['file']}:{h['line_no']}: {h['line'].strip()}")
+                ctx_before = h.get("context_before", [])
+                ctx_after = h.get("context_after", [])
+                rel_path = h.get("rel_path", h['file'])
+                
+                # 构建带上下文的输出
+                entry_lines = []
+                entry_lines.append(f"  📁 {rel_path}:{h['line_no']}")
+                
+                # 显示上下文前
+                if ctx_before:
+                    for i, ctx_line in enumerate(ctx_before, 1):
+                        entry_lines.append(f"     {h['line_no'] - len(ctx_before) + i - 1}: {ctx_line}")
+                
+                # 显示匹配行（高亮）
+                entry_lines.append(f"  → {h['line_no']}: {h['line'].strip()}")
+                
+                # 显示上下文后
+                if ctx_after:
+                    for i, ctx_line in enumerate(ctx_after, 1):
+                        entry_lines.append(f"     {h['line_no'] + i}: {ctx_line}")
+                
+                lines.append("\n".join(entry_lines))
+            
             return True, "\n".join(lines)
 
         # ── list_directory ─────────────────────────────
