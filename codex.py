@@ -661,7 +661,7 @@ class ChatAgent:
         self.tool_call_count = 0
 
         # 系统提示
-        self._system_content = (
+        system_content_parts = [
             f"You are Codex, an expert AI coding assistant embedded in a developer's terminal. "
             f"You have access to the user's codebase and can read, write, search, and modify files. "
             f"You maintain context across the entire conversation. "
@@ -673,7 +673,23 @@ class ChatAgent:
             f"All file operations and shell commands should use this directory as the root. "
             f"When executing shell commands, you do NOT need to specify the working directory - "
             f"commands will automatically run in {workdir}."
-        )
+        ]
+
+        # 读取 agent/skills.md 作为额外的技能提示词（如果存在）
+        skills_path = os.path.join(workdir, "agent", "skills.md")
+        if os.path.exists(skills_path):
+            try:
+                with open(skills_path, "r", encoding="utf-8") as f:
+                    skills_content = f.read()
+                if skills_content.strip():
+                    system_content_parts.append(
+                        f"\n\n## Additional Skills and Instructions\n\n{skills_content}"
+                    )
+            except Exception:
+                # 如果读取失败，静默忽略
+                pass
+
+        self._system_content = "".join(system_content_parts)
 
         self.system_item = {
             "type": "message",
