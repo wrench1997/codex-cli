@@ -224,12 +224,18 @@ def search_in_files(
     """
     在目录中搜索文本，返回匹配列表。
     每项: {file, line_no, line}
+    会自动读取 .gitignore 并排除忽略的文件和目录。
     """
     results = []
     flags = re.MULTILINE
+    base_path = Path(directory).resolve()
+    patterns = _load_gitignore_patterns(base_path)
 
     for p in Path(directory).glob(file_glob):
         if not p.is_file():
+            continue
+        # 检查是否应该被 .gitignore 忽略
+        if _should_ignore(p, base_path, patterns):
             continue
         try:
             content = p.read_text(encoding="utf-8", errors="replace")
