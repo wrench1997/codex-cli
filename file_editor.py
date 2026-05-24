@@ -272,7 +272,7 @@ def search_in_files(
     files_matched = 0
     
     # 始终忽略的目录（与 list_directory 保持一致）
-    ALWAYS_IGNORE_DIRS = {'.git', 'node_modules', '.zig-cache', '__pycache__', '.venv', '.vscode'}
+    ALWAYS_IGNORE_DIRS = {'.git', 'node_modules', '.zig-cache', '__pycache__', '.venv', '.vscode', 'zig-out'}
     
     for p in Path(directory).glob(file_glob):
         if not p.is_file():
