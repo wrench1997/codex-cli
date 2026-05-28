@@ -3,7 +3,10 @@ import json
 import os
 import re
 import time
+import threading
+import urllib.request
 import uuid
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -14,16 +17,76 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # CONFIG
 # =========================================================
 
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://yourserver:7980/v1")
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://yourserver:7980")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3.5-397B-A17B-FP8")
+# vLLM Metrics 端点 URL（从基础 URL 派生）
+METRICS_URL = VLLM_BASE_URL.rstrip("/") + "/metrics"
+# 数据刷新频率（秒）
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 app = FastAPI()
 
 # =========================================================
 # BILLING STATS - 当天计费统计
 # =========================================================
 
+def fetch_metrics(url):
+    """从 vLLM metrics 端点获取数据"""
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            metrics_text = response.read().decode('utf-8')
+            
+            # 打印所有包含 vllm 的行
+            # print("\n" + "="*60)
+            # print("[Metrics] vLLM 相关指标:")
+            # print("="*60)
+            # for line in metrics_text.split('\n'):
+            #     if 'vllm' in line.lower():
+            #         print(line)
+            # print("="*60 + "\n")
+            
+            return metrics_text
+    except Exception as e:
+        print(f"[Metrics] 获取失败：{e}")
+        return None
+
+def extract_metric(metrics_text, metric_name, label_value=None):
+    """
+    正则匹配 Prometheus 格式数据，支持 label 过滤
+    例如：vllm:gpu_prefix_cache_hit_rate{model="Qwen/Qwen3.5-397B-A17B-FP8"} 0.452
+    或：vllm:prefix_cache_hits_total{engine="0",model_name="Qwen/Qwen3.5-397B-A17B-FP8"} 102432.0
+    """
+    if label_value:
+        # 带 label 过滤的匹配
+        pattern = rf'{metric_name}\{{[^}}]*{label_value}[^}}]*\}}\s+([0-9.eE+-]+)'
+    else:
+        pattern = rf'{metric_name}(?:{{[^}}]*}})?\s+([0-9.eE+-]+)'
+    match = re.search(pattern, metrics_text)
+    if match:
+        return float(match.group(1))
+    return None
+
+def calculate_cache_hit_rate(metrics_text):
+    """
+    根据 vLLM metrics 计算前缀缓存命中率
+    命中率 = prefix_cache_hits_total / prefix_cache_queries_total
+    """
+    hits = extract_metric(metrics_text, 'vllm:prefix_cache_hits_total')
+    queries = extract_metric(metrics_text, 'vllm:prefix_cache_queries_total')
+    
+    if hits is not None and queries is not None and queries > 0:
+        return hits / queries
+    return None
+
 class BillingStats:
-    """当天计费统计类 - 基于 TTFT 的缓存命中判断"""
+    """
+    当天计费统计类 - 基于 vLLM Metrics 的精确缓存命中计费
+    
+    计费逻辑：
+    1. 从 vLLM metrics 获取累计的缓存命中 tokens 和计算 tokens
+    2. 记录启动时的基准值，计算增量作为当前会话的统计
+    3. 缓存命中的 tokens 按优惠价格计费，普通 tokens 按标准价格计费
+    """
     def __init__(self):
         self.total_input_tokens = 0
         self.total_output_tokens = 0
@@ -31,7 +94,7 @@ class BillingStats:
         self.normal_input_tokens = 0
         self.request_count = 0
         self.cache_hit_count = 0
-        # TTFT 缓存命中判断：如果 TTFT < 阈值，认为缓存命中
+        # TTFT 缓存命中判断：如果 TTFT < 阈值，认为缓存命中（作为备用方案）
         self.ttft_cache_hit_threshold = float(os.getenv("TTFT_CACHE_HIT_THRESHOLD", "0.5"))  # 秒
         # 动态基准：记录最近 N 次请求的 TTFT 用于比较
         self.ttft_history = []
@@ -40,9 +103,112 @@ class BillingStats:
         self.input_price_per_1m = float(os.getenv("INPUT_PRICE_PER_1M", "3.0"))
         self.output_price_per_1m = float(os.getenv("OUTPUT_PRICE_PER_1M", "6.0"))
         self.cached_input_price_per_1m = float(os.getenv("CACHED_INPUT_PRICE_PER_1M", "0.025"))
+        
+        # vLLM Metrics 缓存命中率（从 /metrics 端点获取）
+        self.gpu_prefix_cache_hit_rate = 0.0
+        self.cpu_prefix_cache_hit_rate = 0.0
+        self.gpu_kv_cache_usage = 0.0
+        self.last_metrics_update = None
+        
+        # Metrics 基准值（启动时的累计值，用于计算增量）
+        self.metrics_baseline_cached = None  # vllm:prompt_tokens_by_source_total{source="local_cache_hit"}
+        self.metrics_baseline_compute = None  # vllm:prompt_tokens_by_source_total{source="local_compute"}
+        self.metrics_baseline_queries = None  # vllm:prefix_cache_queries_total
+        self.metrics_baseline_hits = None     # vllm:prefix_cache_hits_total
+        
+        # 是否已初始化基准值
+        self.metrics_baseline_initialized = False
+        
+        # 启动后台线程定期刷新 metrics
+        self._start_metrics_polling()
+    
+    def _init_metrics_baseline(self, metrics_text):
+        """初始化 metrics 基准值（启动时的累计值）"""
+        self.metrics_baseline_cached = extract_metric(metrics_text, 'vllm:prompt_tokens_by_source_total', 'local_cache_hit')
+        self.metrics_baseline_compute = extract_metric(metrics_text, 'vllm:prompt_tokens_by_source_total', 'local_compute')
+        self.metrics_baseline_queries = extract_metric(metrics_text, 'vllm:prefix_cache_queries_total')
+        self.metrics_baseline_hits = extract_metric(metrics_text, 'vllm:prefix_cache_hits_total')
+        self.metrics_baseline_initialized = True
+        print(f"[BillingStats] Metrics 基准值已初始化:")
+        print(f"  - 缓存命中 tokens 基准：{self.metrics_baseline_cached}")
+        print(f"  - 计算 tokens 基准：{self.metrics_baseline_compute}")
+    
+    def _update_from_metrics(self, metrics_text):
+        """根据 metrics 增量更新缓存命中统计"""
+        if not self.metrics_baseline_initialized:
+            self._init_metrics_baseline(metrics_text)
+            return
+        
+        # 获取当前累计值
+        current_cached = extract_metric(metrics_text, 'vllm:prompt_tokens_by_source_total', 'local_cache_hit')
+        current_compute = extract_metric(metrics_text, 'vllm:prompt_tokens_by_source_total', 'local_compute')
+        current_queries = extract_metric(metrics_text, 'vllm:prefix_cache_queries_total')
+        current_hits = extract_metric(metrics_text, 'vllm:prefix_cache_hits_total')
+        
+        if current_cached is not None and self.metrics_baseline_cached is not None:
+            # 计算增量：当前会话的缓存命中 tokens
+            delta_cached = current_cached - self.metrics_baseline_cached
+            delta_compute = current_compute - self.metrics_baseline_compute
+            
+            if delta_cached > 0 or delta_compute > 0:
+                # 更新统计
+                self.cached_input_tokens = int(delta_cached)
+                self.normal_input_tokens = int(delta_compute)
+                self.total_input_tokens = self.cached_input_tokens + self.normal_input_tokens
+                
+                # 计算缓存命中率
+                if current_queries is not None and self.metrics_baseline_queries is not None:
+                    delta_queries = current_queries - self.metrics_baseline_queries
+                    delta_hits = current_hits - self.metrics_baseline_hits if current_hits and self.metrics_baseline_hits else 0
+                    if delta_queries > 0:
+                        self.gpu_prefix_cache_hit_rate = delta_hits / delta_queries if delta_hits else 0
+                
+                # 估算请求次数（基于 queries 增量）
+                if delta_queries > 0:
+                    # 假设每次请求平均查询一定数量的 tokens
+                    self.request_count = max(self.request_count, int(delta_queries / 1000))  # 粗略估算
+                
+                print(f"[BillingStats] Metrics 更新：cached={self.cached_input_tokens}, compute={self.normal_input_tokens}, hit_rate={self.gpu_prefix_cache_hit_rate:.2%}")
+    
+    def _start_metrics_polling(self):
+        """启动后台线程定期刷新 metrics"""
+        def poll_metrics():
+            while True:
+                metrics_text = fetch_metrics(METRICS_URL)
+                if metrics_text:
+                    # 获取 KV 缓存使用率
+                    gpu_kv = extract_metric(metrics_text, 'vllm:kv_cache_usage_perc')
+                    if gpu_kv is not None:
+                        self.gpu_kv_cache_usage = gpu_kv
+                    
+                    # 更新缓存命中统计（基于 metrics 增量）
+                    self._update_from_metrics(metrics_text)
+                    
+                    self.last_metrics_update = datetime.now()
+                
+                time.sleep(POLL_INTERVAL)
+        
+        thread = threading.Thread(target=poll_metrics, daemon=True)
+        thread.start()
+    
+    def get_current_cache_hit_rate(self) -> float:
+        """获取当前 GPU 前缀缓存命中率"""
+        return self.gpu_prefix_cache_hit_rate
+    
+    def get_metrics_status(self) -> dict:
+        """获取当前 metrics 状态"""
+        return {
+            "gpu_prefix_cache_hit_rate": f"{self.gpu_prefix_cache_hit_rate * 100:.2f}%",
+            "cpu_prefix_cache_hit_rate": f"{self.cpu_prefix_cache_hit_rate * 100:.2f}%",
+            "gpu_kv_cache_usage": f"{self.gpu_kv_cache_usage * 100:.2f}%",
+            "last_update": self.last_metrics_update.strftime("%Y-%m-%d %H:%M:%S") if self.last_metrics_update else "N/A",
+            "baseline_initialized": self.metrics_baseline_initialized,
+            "baseline_cached_tokens": self.metrics_baseline_cached,
+            "baseline_compute_tokens": self.metrics_baseline_compute,
+        }
     
     def is_cache_hit_by_ttft(self, ttft: float) -> bool:
-        """基于 TTFT 判断是否缓存命中"""
+        """基于 TTFT 判断是否缓存命中（备用方案）"""
         # 方法 1：绝对阈值
         if ttft < self.ttft_cache_hit_threshold:
             return True
@@ -61,24 +227,32 @@ class BillingStats:
             self.ttft_history.pop(0)
     
     def add_request(self, input_tokens: int, output_tokens: int, ttft: float = None):
-        """添加一次请求的统计数据"""
+        """
+        添加一次请求的统计数据
+        
+        注意：当 metrics 可用时，tokens 统计由 metrics 增量驱动，
+        此方法主要用于统计 request_count 和 output_tokens
+        """
         self.request_count += 1
-        self.total_input_tokens += input_tokens
         self.total_output_tokens += output_tokens
         
-        # 基于 TTFT 判断缓存命中
-        cache_hit = False
-        cached_tokens = 0
-        if ttft is not None:
-            self.record_ttft(ttft)
-            cache_hit = self.is_cache_hit_by_ttft(ttft)
-            if cache_hit:
-                # 缓存命中时，认为大部分输入 token 来自缓存
-                cached_tokens = int(input_tokens * 0.9)  # 假设 90% 命中
-                self.cache_hit_count += 1
-        
-        self.cached_input_tokens += cached_tokens
-        self.normal_input_tokens += (input_tokens - cached_tokens)
+        # 如果 metrics 尚未初始化，使用 TTFT 估算（临时方案）
+        if not self.metrics_baseline_initialized:
+            self.total_input_tokens += input_tokens
+            
+            cache_hit = False
+            cached_tokens = 0
+            
+            if ttft is not None:
+                self.record_ttft(ttft)
+                cache_hit = self.is_cache_hit_by_ttft(ttft)
+                if cache_hit:
+                    cached_tokens = int(input_tokens * 0.9)
+                    self.cache_hit_count += 1
+            
+            self.cached_input_tokens += cached_tokens
+            self.normal_input_tokens += (input_tokens - cached_tokens)
+        # 如果 metrics 已初始化，tokens 由 _update_from_metrics 更新，这里只更新 output
     
     def calculate_cost(self) -> dict:
         """计算总费用"""
@@ -103,10 +277,17 @@ class BillingStats:
     def to_dict(self) -> dict:
         """返回统计字典"""
         costs = self.calculate_cost()
+        
+        # 计算基于 metrics 的缓存命中率
+        metrics_hit_rate = "N/A"
+        if self.total_input_tokens > 0:
+            metrics_hit_rate = f"{self.cached_input_tokens / self.total_input_tokens * 100:.1f}%"
+        
         return {
             "request_count": self.request_count,
             "cache_hit_count": self.cache_hit_count,
             "cache_hit_rate": f"{self.cache_hit_count/self.request_count*100:.1f}%" if self.request_count > 0 else "N/A",
+            "metrics_cache_hit_rate": metrics_hit_rate,
             "total_input_tokens": self.total_input_tokens,
             "normal_input_tokens": self.normal_input_tokens,
             "cached_input_tokens": self.cached_input_tokens,
@@ -117,6 +298,8 @@ class BillingStats:
             "original_total": f"{costs['original_total']:.6f}",
             "saved_cost": f"{costs['saved_cost']:.6f}",
             "saved_rate": f"{costs['saved_cost']/costs['original_total']*100:.1f}%" if costs['original_total'] > 0 else "0%",
+            # vLLM Metrics 详细信息
+            "metrics": self.get_metrics_status(),
         }
 
 billing_stats = BillingStats()
@@ -358,7 +541,7 @@ async def vllm_stream(payload):
     first_token_received = False
     
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", f"{VLLM_BASE_URL}/chat/completions", json=payload_with_usage) as r:
+        async with client.stream("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload_with_usage) as r:
             async for line in r.aiter_lines():
                 if not line or not line.startswith("data:"): continue
                 data = line[5:].strip()
@@ -542,7 +725,7 @@ async def responses(req: Request):
     # NON-STREAMING (兜底)
     # =====================================
     async with httpx.AsyncClient(timeout=1800) as client:
-        r = await client.post(f"{VLLM_BASE_URL}/chat/completions", json=payload)
+        r = await client.post(f"{VLLM_BASE_URL}/v1/chat/completions", json=payload)
     data = r.json()
     
     # 统计 token 使用（非流式模式）
