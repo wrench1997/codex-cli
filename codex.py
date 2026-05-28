@@ -372,6 +372,7 @@ HELP_TEXT = """
 | `/tokens`       | 估算当前上下文 token 数 |
 | `/mode`         | 切换 chat/agent 模式 |
 | `/tools`        | 显示可用工具列表 |
+| `/billing`      | 显示当天计费统计 |
 | `/exit`         | 退出 |
 
 ## 输入技巧
@@ -1045,6 +1046,40 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
             title="🛠️ 可用工具",
             border_style="green",
         ))
+        return True
+
+    if command == "/billing":
+        # 从本地 gateway 获取计费统计（固定从 localhost:8080 获取）
+        try:
+            import httpx
+            gateway_base = "http://localhost:8080/v1"
+            resp = httpx.get(f"{gateway_base}/billing", timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                console.print(Panel(
+                    f"请求次数：      [bold]{data.get('request_count', 0)}[/bold]\n"
+                    f"缓存命中：      [bold]{data.get('cache_hit_count', 0)}[/bold] ({data.get('cache_hit_rate', 'N/A')})\n"
+                    f"─ 输入 Token ─\n"
+                    f"  总计：        [bold]{data.get('total_input_tokens', 0):,}[/bold]\n"
+                    f"  普通输入：    {data.get('normal_input_tokens', 0):,}\n"
+                    f"  缓存命中：    {data.get('cached_input_tokens', 0):,}\n"
+                    f"─ 输出 Token ─\n"
+                    f"  总计：        [bold]{data.get('total_output_tokens', 0):,}[/bold]\n"
+                    f"─ 费用明细 ─\n"
+                    f"  输入费用：    ¥{data.get('input_cost', '0.000000')}\n"
+                    f"  输出费用：    ¥{data.get('output_cost', '0.000000')}\n"
+                    f"  ───────────────────\n"
+                    f"  实际总费用：  [bold green]¥{data.get('total_cost', '0.000000')}[/bold green]\n"
+                    f"  原始总费用：  ¥{data.get('original_total', '0.000000')}\n"
+                    f"  💵 缓存节省： [bold green]¥{data.get('saved_cost', '0.000000')}[/bold green] ({data.get('saved_rate', '0%')})",
+                    title="💰 当天计费统计",
+                    border_style="yellow",
+                ))
+            else:
+                console.print(f"  [red]获取计费信息失败：HTTP {resp.status_code}[/red]")
+        except Exception as e:
+            console.print(f"  [red]获取计费信息失败：{e}[/red]")
+            console.print("  [dim]提示：确保 codex_gateway.py 正在运行（python -m uvicorn codex_gateway:app --host 0.0.0.0 --port 8080）[/dim]")
         return True
 
     return False

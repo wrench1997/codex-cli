@@ -19,6 +19,109 @@ MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3.5-397B-A17B-FP8")
 app = FastAPI()
 
 # =========================================================
+# BILLING STATS - 当天计费统计
+# =========================================================
+
+class BillingStats:
+    """当天计费统计类 - 基于 TTFT 的缓存命中判断"""
+    def __init__(self):
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.cached_input_tokens = 0
+        self.normal_input_tokens = 0
+        self.request_count = 0
+        self.cache_hit_count = 0
+        # TTFT 缓存命中判断：如果 TTFT < 阈值，认为缓存命中
+        self.ttft_cache_hit_threshold = float(os.getenv("TTFT_CACHE_HIT_THRESHOLD", "0.5"))  # 秒
+        # 动态基准：记录最近 N 次请求的 TTFT 用于比较
+        self.ttft_history = []
+        self.ttft_history_max = 10
+        # 价格配置 (每 1M tokens，人民币)
+        self.input_price_per_1m = float(os.getenv("INPUT_PRICE_PER_1M", "3.0"))
+        self.output_price_per_1m = float(os.getenv("OUTPUT_PRICE_PER_1M", "6.0"))
+        self.cached_input_price_per_1m = float(os.getenv("CACHED_INPUT_PRICE_PER_1M", "0.025"))
+    
+    def is_cache_hit_by_ttft(self, ttft: float) -> bool:
+        """基于 TTFT 判断是否缓存命中"""
+        # 方法 1：绝对阈值
+        if ttft < self.ttft_cache_hit_threshold:
+            return True
+        # 方法 2：与历史平均比较（如果有足够数据）
+        if len(self.ttft_history) >= 3:
+            avg_ttft = sum(self.ttft_history) / len(self.ttft_history)
+            # 如果当前 TTFT 显著低于平均值（比如 50%），认为缓存命中
+            if ttft < avg_ttft * 0.5:
+                return True
+        return False
+    
+    def record_ttft(self, ttft: float):
+        """记录 TTFT 到历史"""
+        self.ttft_history.append(ttft)
+        if len(self.ttft_history) > self.ttft_history_max:
+            self.ttft_history.pop(0)
+    
+    def add_request(self, input_tokens: int, output_tokens: int, ttft: float = None):
+        """添加一次请求的统计数据"""
+        self.request_count += 1
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        
+        # 基于 TTFT 判断缓存命中
+        cache_hit = False
+        cached_tokens = 0
+        if ttft is not None:
+            self.record_ttft(ttft)
+            cache_hit = self.is_cache_hit_by_ttft(ttft)
+            if cache_hit:
+                # 缓存命中时，认为大部分输入 token 来自缓存
+                cached_tokens = int(input_tokens * 0.9)  # 假设 90% 命中
+                self.cache_hit_count += 1
+        
+        self.cached_input_tokens += cached_tokens
+        self.normal_input_tokens += (input_tokens - cached_tokens)
+    
+    def calculate_cost(self) -> dict:
+        """计算总费用"""
+        normal_input_cost = (self.normal_input_tokens / 1_000_000) * self.input_price_per_1m
+        cached_input_cost = (self.cached_input_tokens / 1_000_000) * self.cached_input_price_per_1m
+        output_cost = (self.total_output_tokens / 1_000_000) * self.output_price_per_1m
+        
+        total_input_cost = normal_input_cost + cached_input_cost
+        total_cost = total_input_cost + output_cost
+        original_input_cost = (self.total_input_tokens / 1_000_000) * self.input_price_per_1m
+        original_total = original_input_cost + output_cost
+        saved_cost = original_total - total_cost
+        
+        return {
+            "input_cost": total_input_cost,
+            "output_cost": output_cost,
+            "total_cost": total_cost,
+            "saved_cost": saved_cost,
+            "original_total": original_total,
+        }
+    
+    def to_dict(self) -> dict:
+        """返回统计字典"""
+        costs = self.calculate_cost()
+        return {
+            "request_count": self.request_count,
+            "cache_hit_count": self.cache_hit_count,
+            "cache_hit_rate": f"{self.cache_hit_count/self.request_count*100:.1f}%" if self.request_count > 0 else "N/A",
+            "total_input_tokens": self.total_input_tokens,
+            "normal_input_tokens": self.normal_input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "input_cost": f"{costs['input_cost']:.6f}",
+            "output_cost": f"{costs['output_cost']:.6f}",
+            "total_cost": f"{costs['total_cost']:.6f}",
+            "original_total": f"{costs['original_total']:.6f}",
+            "saved_cost": f"{costs['saved_cost']:.6f}",
+            "saved_rate": f"{costs['saved_cost']/costs['original_total']*100:.1f}%" if costs['original_total'] > 0 else "0%",
+        }
+
+billing_stats = BillingStats()
+
+# =========================================================
 # REGEX
 # =========================================================
 
@@ -245,8 +348,17 @@ def convert_responses_input(input_items, tools=None):
 # =========================================================
 
 async def vllm_stream(payload):
+    """流式请求 vLLM，并测量 TTFT 用于缓存命中判断"""
+    # 添加 stream_options 以请求 vLLM 返回 usage 信息
+    payload_with_usage = payload.copy()
+    payload_with_usage["stream_options"] = {"include_usage": True}
+    
+    start_time = time.perf_counter()
+    ttft_measured = None
+    first_token_received = False
+    
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", f"{VLLM_BASE_URL}/chat/completions", json=payload) as r:
+        async with client.stream("POST", f"{VLLM_BASE_URL}/chat/completions", json=payload_with_usage) as r:
             async for line in r.aiter_lines():
                 if not line or not line.startswith("data:"): continue
                 data = line[5:].strip()
@@ -254,7 +366,31 @@ async def vllm_stream(payload):
                     yield "[DONE]"
                     return
                 try:
-                    yield json.loads(data)
+                    chunk = json.loads(data)
+                    
+                    # 测量 TTFT：检测到第一个有内容的 delta 时记录时间
+                    if not first_token_received:
+                        choices = chunk.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            if delta.get("content") or delta.get("reasoning_content"):
+                                ttft_measured = time.perf_counter() - start_time
+                                first_token_received = True
+                                # 将 TTFT 注入到 chunk 中，供后续使用
+                                if "usage" not in chunk:
+                                    chunk["usage"] = {}
+                                chunk["usage"]["ttft"] = ttft_measured
+                    
+                    # 统计 token 使用
+                    if "usage" in chunk and chunk["usage"]:
+                        usage = chunk["usage"]
+                        input_tokens = usage.get("prompt_tokens", 0)
+                        output_tokens = usage.get("completion_tokens", 0)
+                        # 优先使用 vLLM 返回的 TTFT，否则使用测量的 TTFT
+                        ttft = usage.get("ttft", ttft_measured)
+                        if input_tokens > 0 or output_tokens > 0:
+                            billing_stats.add_request(input_tokens, output_tokens, ttft)
+                    yield chunk
                 except:
                     continue
 
@@ -372,7 +508,10 @@ async def responses(req: Request):
                     yield "data: [DONE]\n\n"
                     return
 
-                delta_obj = chunk.get("choices", [{}])[0].get("delta", {})
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue  # Skip chunks with no choices
+                delta_obj = choices[0].get("delta", {})
                 piece = (
                     delta_obj.get("content")
                     or delta_obj.get("reasoning_content")
@@ -405,6 +544,17 @@ async def responses(req: Request):
     async with httpx.AsyncClient(timeout=1800) as client:
         r = await client.post(f"{VLLM_BASE_URL}/chat/completions", json=payload)
     data = r.json()
+    
+    # 统计 token 使用（非流式模式）
+    usage = data.get("usage")
+    if usage:
+        input_tokens = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+        # 基于 TTFT 的缓存命中统计
+        ttft = usage.get("ttft", None)
+        if input_tokens > 0 or output_tokens > 0:
+            billing_stats.add_request(input_tokens, output_tokens, ttft)
+    
     text = data["choices"][0]["message"].get("content", "")
     tc = parse_xml_tool_call(text)
     
@@ -425,3 +575,21 @@ async def get_response(response_id: str):
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     return JSONResponse({"error": "Please use /v1/responses API for streaming Agent."})
+
+
+# =========================================================
+# BILLING API - 计费查询
+# =========================================================
+
+@app.get("/v1/billing")
+async def get_billing():
+    """获取当天计费统计"""
+    return billing_stats.to_dict()
+
+
+@app.post("/v1/billing/reset")
+async def reset_billing():
+    """重置计费统计"""
+    global billing_stats
+    billing_stats = BillingStats()
+    return {"status": "ok", "message": "计费统计已重置"}
