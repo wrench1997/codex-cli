@@ -244,6 +244,9 @@ def search_in_files(
         每项：{file, line_no, line, context_before, context_after, rel_path}
         会自动读取 .gitignore 并排除忽略的文件和目录。
     """
+    # 确保参数类型正确（兼容 MCP 调用时可能传入字符串的情况）
+    context_lines = int(context_lines) if context_lines else 0
+    max_results = int(max_results) if max_results else 200
     results = []
     base_path = Path(directory).resolve()
     patterns = _load_gitignore_patterns(base_path)
