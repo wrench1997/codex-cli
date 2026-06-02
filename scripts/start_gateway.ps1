@@ -8,7 +8,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
 # 加载 .env 文件中的环境变量
-$envFile = Join-Path $PSScriptRoot ".env"
+$envFile = Join-Path $PSScriptRoot "..\.env"
 if (Test-Path $envFile) {
     Write-Host "[INFO] Loading environment variables from .env..." -ForegroundColor Yellow
     Get-Content $envFile | ForEach-Object {
@@ -78,6 +78,6 @@ Write-Host "[INFO] Press Ctrl+C to stop" -ForegroundColor Gray
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-python -m uvicorn codex_gateway:app --host 0.0.0.0 --port 8080
+python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8080
 
 Read-Host "Press Enter to exit"

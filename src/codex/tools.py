@@ -9,9 +9,9 @@ import os
 import subprocess
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from file_editor import (
+from src.codex.file_editor import (
     apply_patch,
     delete_lines,
     insert_lines,
@@ -256,9 +256,10 @@ def list_tools() -> str:
 # ──────────────────────────────────────────────
 
 class ToolExecutor:
-    def __init__(self, workdir: str, auto_approve: bool = False):
+    def __init__(self, workdir: str, auto_approve: bool = False, mcp_manager=None):
         self.workdir = workdir
         self.auto_approve = auto_approve
+        self.mcp_manager = mcp_manager  # 注入 MCP 管理器
         self._pending_writes: dict[str, str] = {}   # path -> diff (等待审批)
 
     def _resolve(self, path: str) -> str:
@@ -267,9 +268,14 @@ class ToolExecutor:
             return path
         return os.path.join(self.workdir, path)
 
-    def execute(self, name: str, args: dict[str, Any]) -> tuple[bool, str]:
+    async def execute(self, name: str, args: dict[str, Any]) -> tuple[bool, str]:
         """分发工具调用，返回 (success, output)。"""
         try:
+            # 如果匹配到 MCP 工具，交给 MCP 执行
+            if self.mcp_manager and any(t["function"]["name"] == name for t in self.mcp_manager.get_all_tools()):
+                output = await self.mcp_manager.call_tool(name, args)
+                return True, output
+                
             return self._dispatch(name, args)
         except FileNotFoundError as e:
             return False, f"❌ 文件未找到: {e}"

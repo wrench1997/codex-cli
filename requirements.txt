@@ -4,3 +4,6 @@ prompt_toolkit
 click
 pygments
 pathspec
+mcp
+pyyaml
+pywin32

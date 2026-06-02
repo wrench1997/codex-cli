@@ -1,0 +1,29 @@
+[project]
+name = "codex-cli"
+version = "0.1.0"
+description = "Codex CLI - AI 编程助手，支持持续对话、上下文记忆和工具调用"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.4.1",
+    "fastapi>=0.100.0",
+    "httpx>=0.28.1",
+    "mcp>=1.27.2",
+    "pathspec>=1.1.1",
+    "prompt-toolkit>=3.0.52",
+    "pygments>=2.20.0",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "uvicorn>=0.23.0",
+]
+
+[project.scripts]
+codex = "src.codex.cli:main"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

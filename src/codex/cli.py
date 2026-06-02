@@ -48,9 +48,10 @@ from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 
-from config import CONFIG
-from file_editor import list_directory, read_file
-from tools import TOOLS, ToolExecutor
+from src.codex.config import CONFIG
+from src.codex.file_editor import list_directory, read_file
+from src.codex.tools import TOOLS, ToolExecutor
+from src.codex.mcp.manager import McpManager
 
 
     
@@ -372,6 +373,7 @@ HELP_TEXT = """
 | `/tokens`       | 估算当前上下文 token 数 |
 | `/mode`         | 切换 chat/agent 模式 |
 | `/tools`        | 显示可用工具列表 |
+| `/mcp`          | 显示 MCP 服务加载状态 |
 | `/billing`      | 显示当天计费统计 |
 | `/exit`         | 退出 |
 
@@ -648,11 +650,13 @@ class ChatAgent:
         api_base: Optional[str] = None,
         model: Optional[str] = None,
         agent_mode: bool = True,
+        mcp_manager: Optional[McpManager] = None,
     ):
         self.workdir = workdir
         self.auto_approve = auto_approve
         self.agent_mode = agent_mode
-        self.executor = ToolExecutor(workdir, auto_approve=auto_approve)
+        self.mcp_manager = mcp_manager
+        self.executor = ToolExecutor(workdir, auto_approve=auto_approve, mcp_manager=mcp_manager)
 
         self.api_base = _normalize_api_base(api_base or CONFIG.api_base)
         self.model = model or CONFIG.model
@@ -770,7 +774,13 @@ class ChatAgent:
         }
 
         if self.agent_mode:
-            payload["tools"] = TOOLS
+            # 动态合并原生工具和 MCP 工具
+            combined_tools = TOOLS.copy()
+            if self.mcp_manager:
+                mcp_tools = self.mcp_manager.get_all_tools()
+                if mcp_tools:
+                    combined_tools.extend(mcp_tools)
+            payload["tools"] = combined_tools
 
         headers = {}
         if CONFIG.api_key and CONFIG.api_key != "dummy":
@@ -885,7 +895,7 @@ class ChatAgent:
                 if on_tool_call:
                     await on_tool_call(name, args)
 
-                success, output = self.executor.execute(name, args)
+                success, output = await self.executor.execute(name, args)
 
                 # 处理需要审批的写操作
                 if output.startswith("__PENDING_WRITE__"):
@@ -901,7 +911,7 @@ class ChatAgent:
                     if approved:
                         old_auto = self.executor.auto_approve
                         self.executor.auto_approve = True
-                        success, output = self.executor.execute(name, args)
+                        success, output = await self.executor.execute(name, args)
                         self.executor.auto_approve = old_auto
                     else:
                         if reject_reason:
@@ -1046,6 +1056,30 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
             title="🛠️ 可用工具",
             border_style="green",
         ))
+        return True
+
+    if command == "/mcp":
+        if agent.mcp_manager:
+            servers = agent.mcp_manager.servers
+            tools = agent.mcp_manager.get_all_tools()
+            console.print(Panel(
+                f"MCP 管理器：[green]已加载[/green]\n"
+                f"服务器数量：[bold]{len(servers)}[/bold]\n"
+                f"工具数量：[bold]{len(tools)}[/bold]\n\n"
+                f"服务器列表:\n"
+                + "\n".join(f"  • {name}: {'[green]运行中[/green]' if server.is_started() else '[red]已停止[/red]'}" 
+                           for name, server in servers.items())
+                + (f"\n\nMCP 工具列表:\n" + "\n".join(f"  • {tool.get('function', {}).get('name', 'unknown')}" for tool in tools) if tools else "\n[dim]暂无 MCP 工具[/dim]"),
+                title="🔌 MCP 状态",
+                border_style="cyan",
+            ))
+        else:
+            console.print(Panel(
+                "MCP 管理器：[red]未加载[/red]\n\n"
+                "[dim]提示：使用 --mcp 或 --mcp-config 参数启动 MCP 服务[/dim]",
+                title="🔌 MCP 状态",
+                border_style="yellow",
+            ))
         return True
 
     if command == "/billing":
@@ -1375,7 +1409,11 @@ async def _process_message(
               help="纯聊天模式，不使用工具")
 @click.option("--temperature", "-t", default=None, type=float,
               help="采样温度（默认 0.6）")
-def main(task, workdir, auto_approve, model, api, no_agent, temperature):
+@click.option("--mcp", is_flag=True, default=False,
+              help="从配置文件加载 MCP 服务（使用 mcp_config.yaml）")
+@click.option("--mcp-config", type=str, default=None,
+              help="指定 MCP 配置文件路径（默认：./mcp_config.yaml）")
+def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mcp_config):
     """
     Codex Chat — 持续对话的 AI 编程助手
 
@@ -1392,18 +1430,57 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature):
 
     workdir = os.path.abspath(workdir or os.getcwd())
 
-    agent = ChatAgent(
-        workdir=workdir,
-        auto_approve=auto_approve or CONFIG.auto_approve,
-        api_base=CONFIG.api_base,
-        model=CONFIG.model,
-        agent_mode=not no_agent,
-    )
+    async def _main_async():
+        mcp_manager = None
+        
+        # 加载 MCP 配置
+        if mcp or mcp_config:
+            config_path = mcp_config
+            if not config_path:
+                # 优先查找项目根目录的 config 文件夹
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                config_path = os.path.join(project_root, "config", "mcp_config.yaml")
+                if not os.path.exists(config_path):
+                    # 尝试当前工作目录
+                    config_path = os.path.join(workdir, "mcp_config.yaml")
+                if not os.path.exists(config_path):
+                    # 尝试脚本所在目录
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    config_path = os.path.join(script_dir, "mcp_config.yaml")
+            
+            console.print(f"[dim]正在从配置文件加载 MCP 服务：{config_path}[/dim]")
+            mcp_manager = McpManager.from_config(config_path)
+            
+            if mcp_manager.servers:
+                results = await mcp_manager.start_all()
+                success_count = sum(1 for v in results.values() if v)
+                if success_count > 0:
+                    all_tools = mcp_manager.get_all_tools()
+                    console.print(f"[green]✅ 成功启动 {success_count}/{len(mcp_manager.servers)} 个 MCP 服务器，共加载 {len(all_tools)} 个工具[/green]")
+                else:
+                    console.print("[yellow]⚠️  所有 MCP 服务器启动失败，将继续运行但不使用 MCP 功能[/yellow]")
+                    mcp_manager = None
+            else:
+                console.print("[yellow]⚠️  配置文件中未找到启用的 MCP 服务器[/yellow]")
 
-    # 如果有初始任务，传给 repl 先执行，然后继续对话
-    initial = " ".join(task) if task else None
+        try:
+            agent = ChatAgent(
+                workdir=workdir,
+                auto_approve=auto_approve or CONFIG.auto_approve,
+                api_base=CONFIG.api_base,
+                model=CONFIG.model,
+                agent_mode=not no_agent,
+                mcp_manager=mcp_manager,
+            )
 
-    asyncio.run(repl(agent, initial_task=initial))
+            initial = " ".join(task) if task else None
+            await repl(agent, initial_task=initial)
+            
+        finally:
+            if mcp_manager:
+                await mcp_manager.close_all()
+
+    asyncio.run(_main_async())
 
 
 if __name__ == "__main__":
