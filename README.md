@@ -201,7 +201,7 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8080
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `CODEX_API_BASE` | `http://112.111.7.91:7980/v1` | API 基地址 |
+| `CODEX_API_BASE` | `http://yourserver:port/v1` | API 基地址 |
 | `CODEX_MODEL` | `Qwen/Qwen3.5-397B-A17B-FP8` | 模型名称 |
 | `CODEX_API_KEY` | `dummy` | API 密钥 |
 | `CODEX_TEMPERATURE` | `0.6` | 采样温度 |
