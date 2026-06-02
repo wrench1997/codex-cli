@@ -78,6 +78,12 @@ Write-Host "[INFO] Press Ctrl+C to stop" -ForegroundColor Gray
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
+# 切换到项目根目录以确保模块导入正确
+$projectRoot = Join-Path $PSScriptRoot ".."
+Set-Location $projectRoot
+Write-Host "[INFO] Working directory: $projectRoot" -ForegroundColor Gray
+Write-Host ""
+
 python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8080
 
 Read-Host "Press Enter to exit"
