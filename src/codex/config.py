@@ -14,7 +14,7 @@ class Config:
     workspace: str = os.environ.get("CODEX_WORKSPACE", os.getcwd())
     
     # 新增：上下文压缩相关的配置
-    max_context_tokens: int = int(os.environ.get("CODEX_MAX_CONTEXT_TOKENS", "40000"))  # 触发压缩的阈值
+    max_context_tokens: int = int(os.environ.get("CODEX_MAX_CONTEXT_TOKENS", "140000"))  # 触发压缩的阈值
     keep_recent_turns: int = int(os.environ.get("CODEX_KEEP_RECENT_TURNS", "6"))      # 压缩时保留最近几轮对话不压缩
 
 
