@@ -275,7 +275,7 @@ def search_in_files(
     files_matched = 0
     
     # 始终忽略的目录（与 list_directory 保持一致）
-    ALWAYS_IGNORE_DIRS = {'.git', 'node_modules', '.zig-cache', '__pycache__', '.venv', '.vscode', 'zig-out'}
+    ALWAYS_IGNORE_DIRS = {'.git', 'node_modules', '.zig-cache', '__pycache__', '.venv', '.vscode', 'zig-out', '.next'}
     
     for p in Path(directory).glob(file_glob):
         if not p.is_file():
@@ -410,7 +410,7 @@ def list_directory(path: str = ".", depth: int = 2, max_entries_per_dir: int = 1
     patterns = _load_gitignore_patterns(root)
     
     # 始终忽略的目录
-    ALWAYS_IGNORE = {'.git', 'node_modules'}
+    ALWAYS_IGNORE = {'.git', 'node_modules', '.next'}
     
     def _walk(current: Path, prefix: str, d: int):
         if d < 0:

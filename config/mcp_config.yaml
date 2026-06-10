@@ -6,8 +6,11 @@ enabled: true
 
 # MCP 服务器列表
 # 每个服务器可以独立配置命令、参数和是否启用
+# 支持两种传输方式：
+# 1. stdio: 使用 command + args 启动子进程
+# 2. websocket: 使用 websocket_url 连接到远程 MCP 服务器
 servers:
-  # Playwright MCP - 浏览器自动化
+  # Playwright MCP - 浏览器自动化 (stdio 模式)
   - name: playwright
     description: "浏览器自动化操作（导航、点击、截图等）"
     enabled: true
@@ -15,6 +18,16 @@ servers:
     args:
       - "-y"
       - "@playwright/mcp@latest"
+
+  # IndexedDB VFS MCP - RJCut Studio 虚拟文件系统 (WebSocket 模式)
+  # 需要先启动：
+  # 1. RJCut Studio: cd studio && npm run dev
+  # 2. MCP Proxy: node mcp-proxy-server.js
+  - name: indexeddb_vfs
+    description: "RJCut Studio IndexedDB 虚拟文件系统（文件管理、视频项目等）"
+    enabled: false   # 改为 true 以启用
+    websocket_url: "ws://localhost:8001/ws?clientId=studio&role=client"
+    # 注意：使用 WebSocket 模式时，command 和 args 会被忽略
 
 # 全局设置
 settings:

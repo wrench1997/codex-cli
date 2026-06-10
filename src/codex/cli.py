@@ -677,7 +677,11 @@ class ChatAgent:
             f"IMPORTANT: Your current working directory is: {workdir}. "
             f"All file operations and shell commands should use this directory as the root. "
             f"When executing shell commands, you do NOT need to specify the working directory - "
-            f"commands will automatically run in {workdir}."
+            f"commands will automatically run in {workdir}. "
+            f"If you encounter a question you cannot answer or a task you cannot complete, "
+            f"be honest and say so directly. Do not make up answers or give vague responses. "
+            f"Instead, clearly state what you don't know, and invite the user to provide more context "
+            f"or offer their own solution. It's okay to admit limitations."
         ]
 
         # 读取 agent/skills.md 作为额外的技能提示词（如果存在）
@@ -888,6 +892,7 @@ class ChatAgent:
             self.add_assistant(combined)
 
             # ── 逐个执行工具 ──────────────────────────────
+            user_rejected = False  # 标记是否有用户拒绝的操作
             for item in tool_calls:
                 name, args, call_id = _extract_function_call(item)
                 self.tool_call_count += 1
@@ -914,17 +919,28 @@ class ChatAgent:
                         success, output = await self.executor.execute(name, args)
                         self.executor.auto_approve = old_auto
                     else:
+                        # 用户拒绝：直接跳出工具循环，回到正常对话
+                        user_rejected = True
                         if reject_reason:
-                            output = f"用户拒绝了此操作，原因：{reject_reason}"
+                            output = f"用户拒绝了此操作：{reject_reason}"
                         else:
                             output = "用户拒绝了此操作。"
                         success = False
+                        # 把已拒绝的结果加入历史后，立即停止后续工具调用
+                        self.add_tool_result(call_id, output)
+                        if on_tool_result:
+                            await on_tool_result(name, success, output)
+                        break  # 跳出工具循环
 
                 if on_tool_result:
                     await on_tool_result(name, success, output)
 
                 # 把工具结果加入历史
                 self.add_tool_result(call_id, output)
+
+            # 如果用户拒绝了操作，直接结束这轮对话，让 AI 给用户回复空间
+            if user_rejected:
+                return f"\n[操作已取消] 等待你的进一步指示。"
 
             # 继续循环，让模型根据工具结果继续思考
             # 注意：on_token 不需要重置，下一轮会继续追加
