@@ -19,14 +19,25 @@ servers:
       - "-y"
       - "@playwright/mcp@latest"
 
-  # IndexedDB VFS MCP - RJCut Studio 虚拟文件系统 (WebSocket 模式)
+  # IndexedDB VFS MCP - RJCut Studio 虚拟文件系统 (WebSocket 模式 - 旧版)
   # 需要先启动：
   # 1. RJCut Studio: cd studio && npm run dev
   # 2. MCP Proxy: node mcp-proxy-server.js
   - name: indexeddb_vfs
-    description: "RJCut Studio IndexedDB 虚拟文件系统（文件管理、视频项目等）"
-    enabled: false   # 改为 true 以启用
+    description: "RJCut Studio IndexedDB 虚拟文件系统（旧版 WebSocket 模式）"
+    enabled: false
     websocket_url: "ws://localhost:8001/ws?clientId=studio&role=client"
+
+  # Chrome Extension VFS - RJCut Studio 虚拟文件系统 (通过 Bridge Server)
+  # 使用方法：
+  # 1. 在 Chrome 中加载 mcp-proxy-extension 扩展
+  # 2. 启动 Bridge Server: cd studio/mcp-bridge-server && npm install && npm start
+  # 3. Codex 会自动通过 WebSocket 连接到 Bridge Server
+  # 架构：Codex --WS--> Bridge Server --HTTP 轮询--> Chrome Extension --IndexedDB--> RJCut Studio VFS
+  - name: chrome_vfs
+    description: "RJCut Studio IndexedDB VFS (通过 Bridge Server，推荐)"
+    enabled: false
+    websocket_url: "ws://localhost:8766/mcp"
     # 注意：使用 WebSocket 模式时，command 和 args 会被忽略
 
 # 全局设置
