@@ -651,12 +651,14 @@ class ChatAgent:
         model: Optional[str] = None,
         agent_mode: bool = True,
         mcp_manager: Optional[McpManager] = None,
+        vfs_mode: bool = False,
     ):
         self.workdir = workdir
         self.auto_approve = auto_approve
         self.agent_mode = agent_mode
         self.mcp_manager = mcp_manager
-        self.executor = ToolExecutor(workdir, auto_approve=auto_approve, mcp_manager=mcp_manager)
+        self.vfs_mode = vfs_mode  # 虚拟文件系统模式
+        self.executor = ToolExecutor(workdir, auto_approve=auto_approve, mcp_manager=mcp_manager, vfs_mode=vfs_mode)
 
         self.api_base = _normalize_api_base(api_base or CONFIG.api_base)
         self.model = model or CONFIG.model
@@ -1429,7 +1431,11 @@ async def _process_message(
               help="从配置文件加载 MCP 服务（使用 mcp_config.yaml）")
 @click.option("--mcp-config", type=str, default=None,
               help="指定 MCP 配置文件路径（默认：./mcp_config.yaml）")
-def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mcp_config):
+@click.option("--vfs", "vfs_mode", is_flag=True, default=False,
+              help="虚拟文件系统模式：自动启动 RJCut Studio Electron 应用并连接 MCP 服务器，屏蔽本地文件操作工具")
+@click.option("--vfs-port", type=int, default=8001,
+              help="VFS MCP 服务器端口（默认：8001）")
+def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mcp_config, vfs_mode, vfs_port):
     """
     Codex Chat — 持续对话的 AI 编程助手
 
@@ -1449,8 +1455,54 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
     async def _main_async():
         mcp_manager = None
         
-        # 加载 MCP 配置
-        if mcp or mcp_config:
+        # ==================== VFS 模式：从配置文件加载并自动启动 Electron ====================
+        if vfs_mode:
+            console.print(f"\n[bold cyan]🚀 正在启动 VFS 模式（虚拟文件系统专业模式）...[/bold cyan]")
+            console.print(f"[dim]  配置：从 mcp_config.yaml 加载 rjcut_vfs 服务器[/dim]")
+            console.print(f"[dim]  功能：自动启动 Electron 应用 + 连接 MCP 服务器 + 屏蔽本地文件工具[/dim]\n")
+            
+            # 确定配置文件路径
+            config_path = mcp_config
+            if not config_path:
+                # 优先查找项目根目录的 config 文件夹
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                config_path = os.path.join(project_root, "config", "mcp_config.yaml")
+                if not os.path.exists(config_path):
+                    # 尝试当前工作目录
+                    config_path = os.path.join(workdir, "mcp_config.yaml")
+                if not os.path.exists(config_path):
+                    # 尝试脚本所在目录
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    config_path = os.path.join(script_dir, "mcp_config.yaml")
+            
+            if os.path.exists(config_path):
+                console.print(f"[dim]  加载配置文件：{config_path}[/dim]")
+                # 使用 VFS 模式加载配置（只加载 rjcut_vfs 服务器）
+                mcp_manager = McpManager.from_config(config_path, vfs_mode=True)
+                
+                if mcp_manager.servers:
+                    # 启动 MCP 服务器（会自动启动 Electron 应用）
+                    console.print(f"[dim]  正在启动 MCP 服务器...[/dim]")
+                    results = await mcp_manager.start_all()
+                    success_count = sum(1 for v in results.values() if v)
+                    
+                    if success_count > 0:
+                        all_tools = mcp_manager.get_all_tools()
+                        console.print(f"\n[green]✅ VFS MCP 服务器已连接，加载了 {len(all_tools)} 个虚拟文件系统工具[/green]")
+                        console.print(f"\n[bold green]📁 VFS 模式已激活！[/bold green]")
+                        console.print(f"[dim]  - 本地文件操作工具已被屏蔽[/dim]")
+                        console.print(f"[dim]  - 所有文件操作将通过虚拟文件系统执行[/dim]")
+                        console.print(f"[dim]  - 可用工具：vfs_list, vfs_read, vfs_write, vfs_delete, vfs_move, vfs_copy, vfs_mkdir 等[/dim]\n")
+                    else:
+                        console.print("[yellow]⚠️  VFS MCP 服务器连接失败，将回退到普通模式[/yellow]")
+                        mcp_manager = None
+                else:
+                    console.print("[yellow]⚠️  配置文件中未找到 rjcut_vfs 服务器配置[/yellow]")
+            else:
+                console.print(f"[red]❌ 配置文件不存在：{config_path}[/red]")
+        
+        # ==================== 普通 MCP 模式 ====================
+        elif mcp or mcp_config:
             config_path = mcp_config
             if not config_path:
                 # 优先查找项目根目录的 config 文件夹
@@ -1487,6 +1539,7 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
                 model=CONFIG.model,
                 agent_mode=not no_agent,
                 mcp_manager=mcp_manager,
+                vfs_mode=vfs_mode,  # 传递 VFS 模式标志
             )
 
             initial = " ".join(task) if task else None

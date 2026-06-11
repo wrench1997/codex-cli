@@ -1,5 +1,12 @@
 # MCP (Model Context Protocol) 配置文件
 # 用于管理多个 MCP 服务器的启动和工具集成
+#
+# 使用说明:
+#   1. 普通 MCP 模式：python -m src.codex.cli --mcp
+#   2. VFS 专业模式：python -m src.codex.cli --vfs
+#      - 自动启动 Electron 应用
+#      - 自动连接 MCP 服务器
+#      - 屏蔽本地文件工具
 
 # 是否启用 MCP 功能
 enabled: true
@@ -13,32 +20,53 @@ servers:
   # Playwright MCP - 浏览器自动化 (stdio 模式)
   - name: playwright
     description: "浏览器自动化操作（导航、点击、截图等）"
-    enabled: true
+    enabled: false  # 默认禁用，需要时手动开启
     command: npx
     args:
       - "-y"
       - "@playwright/mcp@latest"
 
-  # IndexedDB VFS MCP - RJCut Studio 虚拟文件系统 (WebSocket 模式 - 旧版)
-  # 需要先启动：
-  # 1. RJCut Studio: cd studio && npm run dev
-  # 2. MCP Proxy: node mcp-proxy-server.js
-  - name: indexeddb_vfs
-    description: "RJCut Studio IndexedDB 虚拟文件系统（旧版 WebSocket 模式）"
-    enabled: false
-    websocket_url: "ws://localhost:8001/ws?clientId=studio&role=client"
+  # RJCut Studio Electron MCP - VFS 虚拟文件系统 (WebSocket 模式)
+  # 使用 --vfs 参数时自动启用此配置
+  # 架构：Codex --WS--> Electron MCP Server --原生--> 虚拟文件系统
+  - name: rjcut_vfs
+    description: "RJCut Studio 虚拟文件系统（VFS 专业模式）"
+    enabled: true
+    websocket_url: "ws://localhost:8001/ws"
+    # Electron 应用配置（手动启动模式）
+    # 使用独立 PowerShell 窗口启动：
+    #   .\scripts\start_rjcut_studio.ps1 -studioPath "D:\workspace\rjcut\studio"
+    electron:
+      app_path: "D:\\workspace\\rjcut\\studio"
+      # 使用 cmd /c start 在新窗口中启动 PowerShell（Windows 最可靠方式）
+      # 虽然用的是 cmd，但实际运行的是 PowerShell 脚本
+      start_command: "cmd"
+      start_args: ["/c", "start", "RJCut Studio MCP", "powershell", "-ExecutionPolicy", "Bypass", "-File", "scripts\\start_rjcut_studio.ps1", "-studioPath", "D:\\workspace\\rjcut\\studio"]
+      # 等待 MCP 服务器就绪的时间（秒）- 新窗口启动需要更长时间
+      wait_time: 15
+    # 可用工具：
+    #   - vfs_list: 列出目录内容
+    #   - vfs_read: 读取文件
+    #   - vfs_write: 写入文件
+    #   - vfs_delete: 删除文件/目录
+    #   - vfs_move: 移动/重命名
+    #   - vfs_copy: 复制文件
+    #   - vfs_mkdir: 创建目录
+    #   - vfs_exists: 检查路径是否存在
+    #   - vfs_search: 搜索文件
+    #   - vfs_search_videos: 搜索视频文件
+    #   - vfs_search_json: 搜索 JSON 文件
+    #   - vfs_project_list: 列出项目
+    #   - vfs_project_create: 创建项目
+    #   - vfs_project_read: 读取项目配置
+    #   - vfs_project_update: 更新项目配置
+    #   - vfs_storage_info: 获取存储信息
 
-  # Chrome Extension VFS - RJCut Studio 虚拟文件系统 (通过 Bridge Server)
-  # 使用方法：
-  # 1. 在 Chrome 中加载 mcp-proxy-extension 扩展
-  # 2. 启动 Bridge Server: cd studio/mcp-bridge-server && npm install && npm start
-  # 3. Codex 会自动通过 WebSocket 连接到 Bridge Server
-  # 架构：Codex --WS--> Bridge Server --HTTP 轮询--> Chrome Extension --IndexedDB--> RJCut Studio VFS
-  - name: chrome_vfs
-    description: "RJCut Studio IndexedDB VFS (通过 Bridge Server，推荐)"
+  # RJCut Studio Electron MCP - 旧版兼容配置（手动启动模式）
+  - name: rjcut_studio
+    description: "RJCut Studio Electron MCP 服务器（手动启动）"
     enabled: false
-    websocket_url: "ws://localhost:8766/mcp"
-    # 注意：使用 WebSocket 模式时，command 和 args 会被忽略
+    websocket_url: "ws://localhost:8001/ws"
 
 # 全局设置
 settings:

@@ -256,10 +256,11 @@ def list_tools() -> str:
 # ──────────────────────────────────────────────
 
 class ToolExecutor:
-    def __init__(self, workdir: str, auto_approve: bool = False, mcp_manager=None):
+    def __init__(self, workdir: str, auto_approve: bool = False, mcp_manager=None, vfs_mode: bool = False):
         self.workdir = workdir
         self.auto_approve = auto_approve
         self.mcp_manager = mcp_manager  # 注入 MCP 管理器
+        self.vfs_mode = vfs_mode  # 虚拟文件系统模式
         self._pending_writes: dict[str, str] = {}   # path -> diff (等待审批)
 
     def _resolve(self, path: str) -> str:
@@ -271,6 +272,23 @@ class ToolExecutor:
     async def execute(self, name: str, args: dict[str, Any]) -> tuple[bool, str]:
         """分发工具调用，返回 (success, output)。"""
         try:
+            # VFS 模式：屏蔽本地文件操作工具，只允许通过 MCP 调用虚拟文件系统
+            if self.vfs_mode:
+                # 定义被屏蔽的本地工具列表
+                blocked_local_tools = [
+                    "read_file", "write_file", "search_replace", "insert_lines",
+                    "delete_lines", "replace_lines", "apply_patch", "search_in_files",
+                    "list_directory", "diff_files"
+                ]
+                if name in blocked_local_tools:
+                    # 尝试使用 VFS 前缀的 MCP 工具
+                    vfs_tool_name = f"vfs_{name}"
+                    if self.mcp_manager and any(t["function"]["name"] == vfs_tool_name for t in self.mcp_manager.get_all_tools()):
+                        output = await self.mcp_manager.call_tool(vfs_tool_name, args)
+                        return True, output
+                    # 如果没有对应的 VFS 工具，返回错误提示
+                    return False, f"❌ VFS 模式：本地工具 '{name}' 已被禁用，请使用 MCP 虚拟文件系统工具"
+            
             # 如果匹配到 MCP 工具，交给 MCP 执行
             if self.mcp_manager and any(t["function"]["name"] == name for t in self.mcp_manager.get_all_tools()):
                 output = await self.mcp_manager.call_tool(name, args)

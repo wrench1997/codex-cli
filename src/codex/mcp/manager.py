@@ -9,6 +9,7 @@ MCP (Model Context Protocol) 管理器
 import asyncio
 import os
 import re
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Optional
@@ -38,7 +39,8 @@ class McpServerInstance:
         command: str = "", 
         args: list[str] = None, 
         env: Optional[dict] = None,
-        websocket_url: Optional[str] = None
+        websocket_url: Optional[str] = None,
+        electron_config: Optional[dict] = None  # Electron 应用配置（VFS 模式专用）
     ):
         self.name = name
         self.description = description
@@ -46,11 +48,75 @@ class McpServerInstance:
         self.args = args or []
         self.env = env or {}
         self.websocket_url = websocket_url  # WebSocket URL，如果提供则使用 WebSocket 传输
+        self.electron_config = electron_config or {}  # Electron 配置
         self.session: Optional[ClientSession] = None
         self.mcp_tools: list[dict] = []
         self._exit_stack = AsyncExitStack()
         self._started = False
         self._transport_type = "websocket" if websocket_url else "stdio"
+        self._electron_process = None  # Electron 进程引用
+
+    async def _start_electron_app(self) -> None:
+        """启动 Electron 应用（如果配置了）"""
+        import subprocess
+        
+        app_path = self.electron_config.get("app_path", "")
+        start_command = self.electron_config.get("start_command", "electron")
+        start_args = self.electron_config.get("start_args", ["."])
+        wait_time = self.electron_config.get("wait_time", 5)
+        
+        if not app_path or not os.path.exists(app_path):
+            print(f"[yellow]⚠️  Electron 应用路径不存在：{app_path}[/yellow]")
+            return
+        
+        # 处理 start_args 中的相对路径（特别是 PS1 脚本路径）
+        # 将相对于当前工作目录的路径转换为绝对路径
+        processed_args = []
+        for arg in start_args:
+            if arg.endswith(".ps1") or arg.endswith(".bat") or arg.endswith(".cmd"):
+                # 如果是脚本文件且是相对路径，转换为绝对路径
+                if os.path.isabs(arg):
+                    # 已经是绝对路径，直接使用
+                    processed_args.append(arg)
+                else:
+                    # 相对路径（如 scripts\xxx.ps1 或 .\scripts\xxx.ps1），转换为绝对路径
+                    abs_path = os.path.abspath(arg)
+                    processed_args.append(abs_path)
+            else:
+                processed_args.append(arg)
+        
+        try:
+            print(f"[dim]  正在启动 Electron 应用：{app_path}...[/dim]")
+            # 在 Windows 上使用独立控制台窗口启动
+            if sys.platform.startswith("win"):
+                # 检测是否使用 cmd /c start 模式
+                if start_command == "cmd" and len(processed_args) >= 2 and processed_args[0] == "/c" and processed_args[1] == "start":
+                    # cmd /c start 模式：直接在新窗口启动，不需要 CREATE_NEW_CONSOLE
+                    self._electron_process = subprocess.Popen(
+                        [start_command] + processed_args,
+                        cwd=app_path,
+                    )
+                else:
+                    # 普通模式：使用 CREATE_NEW_CONSOLE 在新窗口中启动
+                    self._electron_process = subprocess.Popen(
+                        [start_command] + processed_args,
+                        cwd=app_path,
+                        creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    )
+            else:
+                self._electron_process = subprocess.Popen(
+                    [start_command] + processed_args,
+                    cwd=app_path,
+                )
+            print(f"[green]✅ Electron 应用已启动（PID: {self._electron_process.pid}）[/green]")
+            
+            # 等待 MCP 服务器就绪
+            print(f"[dim]  等待 MCP 服务器启动（{wait_time}秒）...[/dim]")
+            await asyncio.sleep(wait_time)
+            
+        except Exception as e:
+            print(f"[yellow]⚠️  Electron 应用启动失败：{e}[/yellow]")
+            self._electron_process = None
 
     async def start(self) -> bool:
         """启动 MCP 服务器"""
@@ -61,19 +127,28 @@ class McpServerInstance:
         try:
             if self._transport_type == "websocket" and self.websocket_url:
                 # WebSocket 传输模式
+                # 如果配置了 Electron 应用，先启动它
+                if self.electron_config and self.electron_config.get("app_path"):
+                    await self._start_electron_app()
+                
                 print(f"[dim]正在通过 WebSocket 连接到：{self.websocket_url}...[/dim]")
                 
-                # 建立 WebSocket 连接
-                ws_transport = await self._exit_stack.enter_async_context(
-                    websocket_client(self.websocket_url)
-                )
-                self.read, self.write = ws_transport
-                
-                # 建立 Session
-                self.session = await self._exit_stack.enter_async_context(
-                    ClientSession(self.read, self.write)
-                )
-                await self.session.initialize()
+                try:
+                    # 建立 WebSocket 连接
+                    ws_transport = await self._exit_stack.enter_async_context(
+                        websocket_client(self.websocket_url)
+                    )
+                    self.read, self.write = ws_transport
+                    
+                    # 建立 Session
+                    self.session = await self._exit_stack.enter_async_context(
+                        ClientSession(self.read, self.write)
+                    )
+                    await self.session.initialize()
+                except Exception as ws_error:
+                    print(f"[yellow]⚠️  WebSocket 连接失败：{ws_error}[/yellow]")
+                    print(f"[dim]  提示：请确保目标服务已启动并可访问[/dim]")
+                    return False
             else:
                 # stdio 传输模式（原有逻辑）
                 # 处理环境变量中的 ${VAR} 占位符
@@ -180,8 +255,13 @@ class McpManager:
         self.settings: dict = {}
 
     @classmethod
-    def from_config(cls, config_path: str) -> "McpManager":
-        """从 YAML 配置文件创建管理器"""
+    def from_config(cls, config_path: str, vfs_mode: bool = False) -> "McpManager":
+        """从 YAML 配置文件创建管理器
+        
+        Args:
+            config_path: 配置文件路径
+            vfs_mode: 是否为 VFS 模式（VFS 模式下只启用 rjcut_vfs 服务器）
+        """
         manager = cls()
         
         config_file = Path(config_path)
@@ -206,14 +286,20 @@ class McpManager:
         for server_cfg in config.get("servers", []):
             if not server_cfg.get("enabled", True):
                 continue
-                
+            
+            # VFS 模式：只加载 rjcut_vfs 服务器
+            if vfs_mode:
+                if server_cfg.get("name") != "rjcut_vfs":
+                    continue
+            
             server = McpServerInstance(
                 name=server_cfg.get("name", "unknown"),
                 description=server_cfg.get("description", ""),
                 command=server_cfg.get("command", ""),
                 args=server_cfg.get("args", []),
                 env=server_cfg.get("env", {}),
-                websocket_url=server_cfg.get("websocket_url")  # 可选的 WebSocket URL
+                websocket_url=server_cfg.get("websocket_url"),  # 可选的 WebSocket URL
+                electron_config=server_cfg.get("electron", {})  # Electron 配置（VFS 模式专用）
             )
             manager.servers[server.name] = server
         
