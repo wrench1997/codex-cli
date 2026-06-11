@@ -1,4 +1,10 @@
 output_file: selected_code.txt
 include:
-  - ./*.py
-  - ./*.jinja
+  - "**/*.py"
+  - "**/*.jinja"
+  - "**/*.yaml"
+  - "**/*.yml"
+  - "**/*.toml"
+  - "**/*.md"
+  - "**/*.bat"
+  - "**/*.ps1"

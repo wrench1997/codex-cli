@@ -375,6 +375,8 @@ HELP_TEXT = """
 | `/tools`        | 显示可用工具列表 |
 | `/mcp`          | 显示 MCP 服务加载状态 |
 | `/billing`      | 显示当天计费统计 |
+| `/memory`       | 查看当前提炼的核心记忆点 |
+| `/compress`     | 手动压缩并归纳历史上下文 |
 | `/exit`         | 退出 |
 
 ## 输入技巧
@@ -710,6 +712,9 @@ class ChatAgent:
 
         # 完整对话历史（包含 system）
         self.input_items: list[dict] = [self.system_item]
+        
+        # 长期记忆（上下文压缩后生成的核心记忆点）
+        self.memory_summary = ""
 
     # ── 历史管理 ──────────────────────────────────────────
 
@@ -760,6 +765,99 @@ class ChatAgent:
             for item in self.input_items
         )
         return total_chars // 2
+
+    # ── 记忆与上下文压缩 ──────────────────────────────────────
+
+    async def _generate_summary(self, old_messages_text: str) -> str:
+        """调用大模型，生成结构化记忆总结"""
+        prompt = f"""你是一个 AI 架构师的记忆管理模块。请总结以下历史对话记录，提取对后续编程任务有用的核心信息。
+要求尽可能简练，保留关键的文件路径、函数名、已经验证的结论和当前的报错信息。
+
+请按以下结构输出：
+1. 🎯 核心目标：用户最终想实现什么
+2. ✅ 已完成工作：我们已经修改了哪些文件，执行了什么重要命令
+3. 🚧 当前状态/卡点：最新的报错是什么，或者当前卡在哪个步骤
+4. 🧠 关键记忆点：重要的全局变量、约定规则、环境信息
+
+以下是需要压缩的历史记录：
+--------------------
+{old_messages_text}
+--------------------
+"""
+        payload = {
+            "model": self.model,
+            "input": [{"type": "message", "role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": 0.1,  # 总结任务需要低温度，保证客观真实
+        }
+        
+        headers = {}
+        if CONFIG.api_key and CONFIG.api_key != "dummy":
+            headers["Authorization"] = f"Bearer {CONFIG.api_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{self.api_base}/responses",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # 提取返回文本
+                output_items = data.get("output", [])
+                if output_items and output_items[0].get("content"):
+                    return output_items[0]["content"][0]["text"]
+        except Exception as e:
+            return f"（压缩上下文失败，错误：{e}）"
+            
+        return "（未生成有效总结）"
+
+    async def compress_context(self):
+        """执行上下文压缩"""
+        # 1. 至少要有一定数量的消息才进行压缩
+        # 系统提示 (1) + 历史记忆 (1, 可选) + 要压缩的旧消息 + 保留的新消息
+        keep_items = CONFIG.keep_recent_turns * 2  # 一轮对话通常包含一问一答，甚至包含工具结果
+        if len(self.input_items) <= keep_items + 2:
+            return
+
+        # 2. 分离消息
+        system_msg = self.input_items[0]
+        # 找到最近的消息
+        recent_msgs = self.input_items[-keep_items:]
+        # 中间的是需要被压缩的旧消息
+        old_msgs = self.input_items[1:-keep_items]
+        
+        # 将历史记忆转为文本格式供模型阅读
+        history_lines = []
+        for item in old_msgs:
+            role = item.get("role", item.get("type", "unknown"))
+            content = item.get("content", item.get("output", ""))
+            # 过滤掉过长的 diff 和原始内容，只保留思路
+            content_str = str(content)
+            if len(content_str) > 1000:
+                content_str = content_str[:1000] + "\n...(内容过长截断)..."
+            history_lines.append(f"[{role}]: {content_str}")
+        
+        history_text = "\n\n".join(history_lines)
+
+        # 3. 调用模型生成新的总结
+        new_summary = await self._generate_summary(history_text)
+        
+        # 4. 如果之前已经有记忆了，把旧记忆合并到新记忆的开头（滚动迭代）
+        if self.memory_summary:
+            self.memory_summary = f"{new_summary}\n\n(上期残留记忆:\n{self.memory_summary[:500]})"
+        else:
+            self.memory_summary = new_summary
+
+        # 5. 重构 input_items，将记忆作为一条特殊 System 消息注入
+        memory_msg = {
+            "type": "message",
+            "role": "system",
+            "content": f"【系统提示：之前的历史对话已压缩为核心记忆】\n\n{self.memory_summary}\n\n请在后续回答中基于上述记忆推进工作。"
+        }
+        
+        self.input_items = [system_msg, memory_msg] + recent_msgs
 
     # ── HTTP 流式调用 ──────────────────────────────────────
 
@@ -860,6 +958,14 @@ class ChatAgent:
         - 自动将工具结果追加进历史
         - 返回最终文本回复
         """
+        # ==== 新增：在每轮开始前检查是否需要压缩上下文 ====
+        current_tokens = self.estimate_tokens()
+        if current_tokens > CONFIG.max_context_tokens:
+            console.print(f"\n[bold yellow]⚠️ 当前上下文达到 {current_tokens:,} tokens，正在进行记忆压缩与归纳...[/bold yellow]")
+            await self.compress_context()
+            console.print("[bold green]✅ 记忆压缩完成，已释放多余上下文！[/bold green]\n")
+        # ===================================================
+        
         self.turn_count += 1
 
         for _loop in range(CONFIG.max_turns):
@@ -1132,6 +1238,23 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
         except Exception as e:
             console.print(f"  [red]获取计费信息失败：{e}[/red]")
             console.print("  [dim]提示：确保 codex_gateway.py 正在运行（python -m uvicorn codex_gateway:app --host 0.0.0.0 --port 8080）[/dim]")
+        return True
+
+    if command == "/memory":
+        if agent.memory_summary:
+            console.print(Panel(
+                agent.memory_summary,
+                title="🧠 当前核心记忆",
+                border_style="magenta"
+            ))
+        else:
+            console.print("  [dim]当前没有记录长期记忆。[/dim]")
+        return True
+
+    if command == "/compress":
+        console.print("[yellow]手动触发记忆压缩中...[/yellow]")
+        await agent.compress_context()
+        console.print("[green]压缩完成！使用 /memory 查看提取的关键记忆点。[/green]")
         return True
 
     return False
