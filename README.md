@@ -1,6 +1,6 @@
 # Codex CLI
 
-一个强大的 AI 编程助手，支持持续对话、上下文记忆和工具调用。
+一个强大的 AI 编程助手，支持持续对话、上下文记忆、工具调用和虚拟文件系统（VFS）集成。
 
 ## 功能特性
 
@@ -9,6 +9,8 @@
 - 🔌 **MCP 支持** - 集成 Model Context Protocol，扩展工具生态
 - 📝 **代码编辑** - 支持 diff 预览、行级编辑、搜索替换
 - 💰 **计费统计** - 实时监控 token 使用和缓存命中
+- 🧠 **上下文压缩** - 自动压缩长对话历史，提取核心记忆点
+- 🗂️ **VFS 模式** - 虚拟文件系统专业模式，安全操作隔离环境
 
 ## 技术栈
 
@@ -35,10 +37,15 @@ codex-cli/
 │   ├── mcp_config.yaml    # MCP 服务器配置
 │   └── upload_config.yaml
 ├── scripts/                # 启动脚本
-│   ├── mcodex.bat
-│   └── start_gateway.ps1
+│   ├── mcodex.bat         # Windows 批处理启动器
+│   ├── mcodex.ps1         # PowerShell 智能启动器
+│   ├── start_gateway.ps1  # API 网关启动脚本
+│   └── start_rjcut_studio.ps1  # RJCut Studio MCP 启动脚本
 ├── tests/                  # 测试文件
 ├── docs/                   # 文档
+│   ├── MCP_USAGE.md       # MCP 使用指南
+│   └── VFS_MODE.md        # VFS 模式文档
+├── count_src_lines_yaml.py # 代码行数统计工具
 ├── pyproject.toml
 └── requirements.txt
 ```
@@ -116,6 +123,12 @@ python -m src.codex.cli --dir /path/to/project
 
 # 纯聊天模式（不调用工具）
 python -m src.codex.cli --no-agent
+
+# VFS 模式（虚拟文件系统专业模式）
+python -m src.codex.cli --vfs
+
+# VFS 模式 + 自动审批
+python -m src.codex.cli --vfs -y "帮我创建一个视频项目"
 ```
 
 ### 常用参数
@@ -129,6 +142,8 @@ python -m src.codex.cli --no-agent
 | `-t, --temperature` | 采样温度 |
 | `--mcp` | 加载 MCP 服务 |
 | `--mcp-config` | 指定 MCP 配置文件 |
+| `--vfs` | VFS 模式：自动启动 Electron 应用并连接虚拟文件系统 |
+| `--vfs-port` | VFS MCP 服务器端口（默认：8001） |
 
 ### 内置命令
 
@@ -149,6 +164,8 @@ python -m src.codex.cli --no-agent
 | `/tools` | 显示可用工具列表 |
 | `/mcp` | 显示 MCP 服务状态 |
 | `/billing` | 显示当天计费统计 |
+| `/memory` | 查看当前提炼的核心记忆点 |
+| `/compress` | 手动压缩并归纳历史上下文 |
 | `/exit` | 退出 |
 
 ### 输入技巧
@@ -168,12 +185,25 @@ settings:
   timeout: 30
 
 servers:
+  # stdio 模式：使用命令启动子进程
   - name: playwright
     description: Playwright 浏览器自动化
     command: npx
     args:
       - "@playwright/mcp@latest"
+    enabled: false  # 默认禁用，需要时手动开启
+  
+  # WebSocket 模式：连接到远程 MCP 服务器
+  - name: rjcut_vfs
+    description: RJCut Studio 虚拟文件系统（VFS 专业模式）
     enabled: true
+    websocket_url: "ws://localhost:8001/ws"
+    # Electron 应用配置（VFS 模式自动启动）
+    electron:
+      app_path: "D:\\workspace\\rjcut\\studio"
+      start_command: "cmd"
+      start_args: ["/c", "start", "RJCut Studio MCP", "powershell", "-ExecutionPolicy", "Bypass", "-File", "scripts\\start_rjcut_studio.ps1", "-studioPath", "D:\\workspace\\rjcut\\studio"]
+      wait_time: 15  # 等待 MCP 服务器就绪的时间（秒）
 ```
 
 启动时添加 `--mcp` 参数：
@@ -181,6 +211,26 @@ servers:
 ```bash
 python -m src.codex.cli --mcp
 ```
+
+### VFS 模式（虚拟文件系统专业模式）
+
+VFS 模式是专门为 RJCut Studio 虚拟文件系统设计的专业工作模式：
+
+```bash
+# 启动 VFS 模式（自动启动 Electron 应用 + 连接 MCP 服务器 + 屏蔽本地文件工具）
+python -m src.codex.cli --vfs
+
+# VFS 模式 + 指定任务
+python -m src.codex.cli --vfs "帮我创建一个视频项目"
+```
+
+**VFS 模式特性**：
+- ✅ 自动启动 RJCut Studio Electron 应用
+- ✅ 自动连接 MCP 服务器（端口 8001）
+- ✅ 屏蔽本地文件操作工具，避免误操作真实文件系统
+- ✅ 全部使用虚拟文件系统工具（vfs_read, vfs_write, vfs_list 等）
+
+详细说明请参考：[docs/VFS_MODE.md](docs/VFS_MODE.md)
 
 ## API 网关
 
@@ -207,8 +257,54 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8080
 | `CODEX_TEMPERATURE` | `0.6` | 采样温度 |
 | `CODEX_MAX_TURNS` | `50` | 最大工具调用轮次 |
 | `CODEX_AUTO_APPROVE` | `false` | 自动审批 |
+| `CODEX_MAX_CONTEXT_TOKENS` | `140000` | 触发上下文压缩的 token 阈值 |
+| `CODEX_KEEP_RECENT_TURNS` | `6` | 上下文压缩时保留的最近对话轮数 |
+| `CODEX_PROJECT_DIR` | (自动检测) | 项目根目录（mcodex.ps1 使用） |
 | `VLLM_BASE_URL` | `http://yourserver:7980` | vLLM 地址（网关用） |
 | `POLL_INTERVAL` | `5` | Metrics 刷新间隔（秒） |
+
+## 启动脚本
+
+### mcodex.ps1 - PowerShell 智能启动器
+
+智能启动器，支持自动检测项目目录和安装依赖：
+
+```powershell
+# 基本用法
+.\scripts\mcodex.ps1
+
+# 执行任务
+.\scripts\mcodex.ps1 "帮我重构代码"
+
+# 使用 MCP 模式
+.\scripts\mcodex.ps1 --mcp
+
+# 使用 VFS 模式
+.\scripts\mcodex.ps1 --vfs
+```
+
+**特性**：
+- 自动检测项目根目录（通过 `pyproject.toml`）
+- 支持 `CODEX_PROJECT_DIR` 环境变量覆盖
+- 自动安装 `uv`（如果未安装）
+- 智能路径解析
+
+### start_rjcut_studio.ps1 - RJCut Studio MCP 启动脚本
+
+用于手动启动 RJCut Studio MCP 服务器：
+
+```powershell
+# 使用默认配置
+.\scripts\start_rjcut_studio.ps1
+
+# 指定 Studio 路径
+.\scripts\start_rjcut_studio.ps1 -studioPath "D:\workspace\rjcut\studio"
+```
+
+## 相关文档
+
+- [MCP 使用指南](docs/MCP_USAGE.md) - MCP 服务器配置和使用
+- [VFS 模式文档](docs/VFS_MODE.md) - 虚拟文件系统专业模式详解
 
 ## 许可证
 
