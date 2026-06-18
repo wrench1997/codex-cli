@@ -208,6 +208,97 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_log",
+            "description": "获取 git 提交历史。返回最近的提交记录列表。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "获取的提交数量", "default": 10},
+                    "author": {"type": "string", "description": "按作者过滤（可选）"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_show",
+            "description": "获取指定 commit 的详细信息和代码改动（diff）。用于查看某人提交了什么、改了什么代码。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "commit_hash": {"type": "string", "description": "提交 hash（可以是短 hash，如 8aca63ca）"},
+                    "max_lines": {"type": "integer", "description": "最大返回行数，防止输出过长", "default": 500},
+                    "show_source": {"type": "boolean", "description": "是否显示修改后的完整源代码（如果文件还存在）", "default": False},
+                },
+                "required": ["commit_hash"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": "获取当前 git 工作区状态，显示未提交的改动。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "show_untracked": {"type": "boolean", "description": "是否显示未跟踪的文件", "default": True},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": "获取两个 commit 之间或当前工作区与暂存区的差异。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "目标（可以是 commit hash、分支名，或空表示工作区对比暂存区）"},
+                    "cached": {"type": "boolean", "description": "是否对比暂存区与 HEAD", "default": False},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pack_for_ai",
+            "description": "打包源代码和 git 历史到单个文件，方便发送给其他 AI 求助。支持配置文件选择要包含的文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "config_file": {"type": "string", "description": "配置文件路径（YAML 格式），默认 upload_config.yaml", "default": "upload_config.yaml"},
+                    "include_git": {"type": "boolean", "description": "是否包含 git 历史", "default": True},
+                    "git_limit": {"type": "integer", "description": "包含的 git 提交数量", "default": 10},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "export_commit",
+            "description": "单独导出某个 commit 的详细改动到 TXT 文件，方便发给 AI 询问具体改动。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "commit_hash": {"type": "string", "description": "提交 hash（可以是短 hash）"},
+                    "output_file": {"type": "string", "description": "输出文件名，默认 commit_{hash}.txt"},
+                },
+                "required": ["commit_hash"],
+            },
+        },
+    },
 ]
 
 # ──────────────────────────────────────────────
@@ -500,6 +591,229 @@ class ToolExecutor:
             b = self._resolve(args["path_b"])
             diff = _make_diff(_read(a), _read(b), args["path_a"])
             return True, diff or "(文件相同)"
+# ── git_log ─────────────────────────────────
+        elif name == "git_log":
+            limit = int(args.get("limit", 10))
+            author = args.get("author", "")
+            
+            cmd = ["git", "log", f"-{limit}", "--pretty=format:%H|%an|%ae|%ai|%s", "--no-merges"]
+            if author:
+                cmd.extend(["--author", author])
+            
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.workdir)
+                commits = []
+                for line in result.stdout.strip().split("\n"):
+                    if line:
+                        parts = line.split("|", 4)
+                        if len(parts) == 5:
+                            commits.append({
+                                "hash": parts[0],
+                                "author": parts[1],
+                                "email": parts[2],
+                                "date": parts[3],
+                                "message": parts[4]
+                            })
+                
+                if not commits:
+                    return True, "📝 没有找到提交记录"
+                
+                output = [f"📜 最近 {len(commits)} 条提交历史:\n"]
+                for i, c in enumerate(commits, 1):
+                    output.append(f"[{i}] {c['hash'][:8]} | {c['author']} | {c['date'][:10]}")
+                    output.append(f"    └─ {c['message']}")
+                
+                return True, "\n".join(output)
+            except subprocess.CalledProcessError as e:
+                return False, f"❌ git log 失败：{e}"
+
+        # ── git_show ─────────────────────────────────
+        elif name == "git_show":
+            commit_hash = args["commit_hash"]
+            max_lines = int(args.get("max_lines", 500))
+            show_source = args.get("show_source", False)  # 是否显示修改后的完整源代码
+            
+            try:
+                # 第一步：获取提交信息和 diff
+                result = subprocess.run(
+                    ["git", "show", "--pretty=full", "--stat", "-p", commit_hash],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    cwd=self.workdir
+                )
+                
+                output_parts = []
+                output_parts.append("=" * 80)
+                output_parts.append(f"📝 Commit: {commit_hash}")
+                output_parts.append("=" * 80)
+                output_parts.append("")
+                
+                # 解析输出，分离 commit 信息和文件改动统计
+                raw_lines = result.stdout.split("\n")
+                
+                # 提取 commit 信息（到第一个 diff --git 之前）
+                commit_info_lines = []
+                changed_files = []
+                in_diff = False
+                
+                for line in raw_lines:
+                    if line.startswith("diff --git"):
+                        in_diff = True
+                        # 提取文件名（从 b/ 后面取）
+                        # 格式：diff --git a/file.txt b/file.txt
+                        match_parts = line.split(" b/")
+                        if len(match_parts) == 2:
+                            file_path = match_parts[1].strip()
+                            changed_files.append(file_path)
+                    if not in_diff:
+                        commit_info_lines.append(line)
+                
+                # 添加 commit 信息
+                output_parts.extend(commit_info_lines)
+                output_parts.append("")
+                output_parts.append("-" * 80)
+                output_parts.append(f"📁 修改的文件 ({len(changed_files)} 个):")
+                for f in changed_files:
+                    output_parts.append(f"  • {f}")
+                output_parts.append("")
+                
+                # 如果 show_source 为 True，读取并显示修改后的文件内容
+                if show_source and changed_files:
+                    output_parts.append("=" * 80)
+                    output_parts.append("📄 修改后的源代码内容:")
+                    output_parts.append("=" * 80)
+                    
+                    for file_path in changed_files:
+                        full_path = self._resolve(file_path)
+                        if os.path.exists(full_path):
+                            try:
+                                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    content = f.read()
+                                    lines_count = len(content.split("\n"))
+                                    output_parts.append("")
+                                    output_parts.append(f"{'='*60}")
+                                    output_parts.append(f"📄 FILE: {file_path} ({lines_count} 行)")
+                                    output_parts.append(f"{'='*60}")
+                                    output_parts.append(content)
+                            except Exception as e:
+                                output_parts.append(f"⚠️  无法读取 {file_path}: {e}")
+                        else:
+                            output_parts.append(f"⚠️  文件已删除或不存在：{file_path}")
+                    output_parts.append("")
+                
+                # 添加详细 diff（如果空间允许）
+                remaining_lines = max_lines - len(output_parts)
+                if remaining_lines > 50:
+                    output_parts.append("=" * 80)
+                    output_parts.append("📝 详细 Diff:")
+                    output_parts.append("=" * 80)
+                    
+                    # 重新获取带完整 diff 的输出
+                    diff_result = subprocess.run(
+                        ["git", "show", "-p", commit_hash],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        cwd=self.workdir
+                    )
+                    diff_lines = diff_result.stdout.split("\n")
+                    
+                    if len(diff_lines) > remaining_lines:
+                        output_parts.extend(diff_lines[:remaining_lines])
+                        output_parts.append(f"\n... (diff 被截断，共超过 {remaining_lines} 行)")
+                    else:
+                        output_parts.extend(diff_lines)
+                
+                final_output = "\n".join(output_parts)
+                if len(final_output.split("\n")) > max_lines:
+                    final_lines = final_output.split("\n")[:max_lines]
+                    final_lines.append(f"\n... (总输出被截断，共超过 {max_lines} 行)")
+                    final_output = "\n".join(final_lines)
+                
+                return True, final_output
+            except subprocess.CalledProcessError as e:
+                return False, f"❌ git show 失败：{e}"
+
+        # ── git_status ─────────────────────────────────
+        elif name == "git_status":
+            show_untracked = args.get("show_untracked", True)
+            
+            try:
+                cmd = ["git", "status"]
+                if not show_untracked:
+                    cmd.append("--untracked-files=no")
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.workdir)
+                return True, f"📝 Git 工作区状态:\n{result.stdout}"
+            except subprocess.CalledProcessError as e:
+                return False, f"❌ git status 失败：{e}"
+
+        # ── git_diff ─────────────────────────────────
+        elif name == "git_diff":
+            target = args.get("target", "")
+            cached = args.get("cached", False)
+            
+            try:
+                cmd = ["git", "diff"]
+                if cached:
+                    cmd.append("--cached")
+                if target:
+                    cmd.append(target)
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.workdir)
+                
+                if not result.stdout.strip():
+                    return True, "📝 没有差异"
+                
+                return True, f"📊 Git 差异:\n{result.stdout}"
+            except subprocess.CalledProcessError as e:
+                return False, f"❌ git diff 失败：{e}"
+
+        # ── pack_for_ai ─────────────────────────────────
+        elif name == "pack_for_ai":
+            config_file = args.get("config_file", "upload_config.yaml")
+            include_git = args.get("include_git", True)
+            git_limit = int(args.get("git_limit", 10))
+            
+            config_path = self._resolve(config_file)
+            
+            if not os.path.exists(config_path):
+                return False, f"❌ 配置文件不存在：{config_path}"
+            
+            # 导入 pack_for_ai 模块（内置在 src.codex.pack_for_ai）
+            from src.codex.pack_for_ai import pack_for_ai as pack_func
+            
+            # 执行打包（传入当前工作目录，确保 git 命令在正确的项目目录执行）
+            output_file = pack_func(
+                config_path=config_path,
+                include_git=include_git,
+                git_limit=git_limit,
+                cwd=self.workdir  # 使用工具执行器的工作目录
+            )
+            
+            if output_file:
+                return True, f"✅ 打包完成！\n输出文件：{output_file}\n\n可以直接发送这个文件给其他 AI 求助。"
+            else:
+                return False, "❌ 打包失败"
+
+        # ── export_commit ─────────────────────────────────
+        elif name == "export_commit":
+            commit_hash = args["commit_hash"]
+            output_file = args.get("output_file", "")
+            
+            # 导入 pack_for_ai 模块（内置在 src.codex.pack_for_ai）
+            from src.codex.pack_for_ai import export_single_commit
+            
+            if not output_file:
+                output_file = f"commit_{commit_hash[:8]}.txt"
+            
+            result_file = export_single_commit(commit_hash, output_file)
+            
+            if result_file:
+                return True, f"✅ 已导出 commit {commit_hash[:8]}\n文件：{result_file}\n\n可以发送这个文件给 AI 询问具体改动。"
+            else:
+                return False, f"❌ 导出失败，请检查 commit hash 是否正确：{commit_hash}"
 
         else:
             return False, f"❌ 未知工具: {name}"

@@ -1,0 +1,19 @@
+output_file: selected_code.txt
+include:
+  # 🐍 当前项目 Python 源码
+  - "src/codex/*.py"
+  - "src/codex/mcp/*.py"
+  - "gateway/*.py"
+  - "main.py"
+  - "count_src_lines_yaml.py"
+  - "pack_for_ai.py"
+  
+  # 📄 配置文件和文档
+  - "*.yaml"
+  - "*.md"
+  - "docs/*.md"
+
+# Git 设置（可选）
+git_settings:
+  include_git: true      # 是否包含 git 提交历史
+  commit_limit: 10       # 包含最近多少次提交

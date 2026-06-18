@@ -168,6 +168,36 @@ python -m src.codex.cli --vfs -y "帮我创建一个视频项目"
 | `/compress` | 手动压缩并归纳历史上下文 |
 | `/exit` | 退出 |
 
+### 🆕 Git 工具（AI 可自动调用）
+
+Codex 现在集成了完整的 Git 工具，AI 可以自动调用它们来查看代码历史、打包代码求助其他 AI：
+
+| 工具名 | 功能描述 |
+|--------|----------|
+| `git_log` | 查看最近的提交历史 |
+| `git_show` | 查看某个 commit 的详细代码改动 |
+| `git_status` | 查看当前工作区状态 |
+| `git_diff` | 查看分支或 commit 之间的差异 |
+| `pack_for_ai` | 🌟 打包源代码 + Git 历史到单个文件，方便发送给其他 AI 求助 |
+| `export_commit` | 🌟 单独导出某个 commit 的改动到 TXT 文件 |
+
+**使用示例：**
+```python
+# 让 AI 打包代码求助
+"帮我把当前项目的代码和最近的 git 提交打包，我要发给其他 AI 求助"
+→ AI 会自动调用 pack_for_ai() 生成 selected_code.txt
+
+# 查看某个提交的改动
+"看看 8aca63ca 这个提交改了什么代码"
+→ AI 会调用 git_show(commit_hash="8aca63ca")
+
+# 导出特定 commit 询问
+"把上次修复 bug 的提交单独导出来"
+→ AI 会调用 export_commit(commit_hash="...") 生成 commit_xxx.txt
+```
+
+详细文档：[docs/GIT_TOOLS.md](docs/GIT_TOOLS.md)
+
 ### 输入技巧
 
 - **多行输入**: 按 `Esc+Enter` 换行，`Enter` 发送
