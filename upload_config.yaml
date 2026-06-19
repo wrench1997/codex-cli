@@ -16,4 +16,4 @@ include:
 # Git 设置（可选）
 git_settings:
   include_git: true      # 是否包含 git 提交历史
-  commit_limit: 10       # 包含最近多少次提交
+  commit_limit: 1        # 包含最近多少次提交

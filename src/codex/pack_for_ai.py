@@ -156,7 +156,7 @@ def get_current_branch():
         return "unknown"
 
 
-def pack_for_ai(config_path, output_file=None, include_git=True, git_limit=10, cwd=None):
+def pack_for_ai(config_path, output_file=None, include_git=True, git_limit=1, cwd=None):
     """
     打包代码和 git 历史到单个文件
     
@@ -429,7 +429,7 @@ def main():
             ],
             "git_settings": {
                 "include_git": True,
-                "commit_limit": 10
+                "commit_limit": 1
             }
         }
         
@@ -446,7 +446,7 @@ def main():
     
     git_settings = config.get("git_settings", {})
     include_git = git_settings.get("include_git", True)
-    git_limit = git_settings.get("commit_limit", 10)
+    git_limit = git_settings.get("commit_limit", 1)
     
     # 执行打包
     pack_for_ai(

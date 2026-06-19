@@ -216,7 +216,7 @@ TOOLS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "description": "获取的提交数量", "default": 10},
+                    "limit": {"type": "integer", "description": "获取的提交数量", "default": 1},
                     "author": {"type": "string", "description": "按作者过滤（可选）"},
                 },
                 "required": [],
@@ -278,7 +278,7 @@ TOOLS: list[dict] = [
                 "properties": {
                     "config_file": {"type": "string", "description": "配置文件路径（YAML 格式），默认 upload_config.yaml", "default": "upload_config.yaml"},
                     "include_git": {"type": "boolean", "description": "是否包含 git 历史", "default": True},
-                    "git_limit": {"type": "integer", "description": "包含的 git 提交数量", "default": 10},
+                    "git_limit": {"type": "integer", "description": "包含的 git 提交数量", "default": 1},
                 },
                 "required": [],
             },
@@ -593,7 +593,7 @@ class ToolExecutor:
             return True, diff or "(文件相同)"
 # ── git_log ─────────────────────────────────
         elif name == "git_log":
-            limit = int(args.get("limit", 10))
+            limit = int(args.get("limit", 1))
             author = args.get("author", "")
             
             cmd = ["git", "log", f"-{limit}", "--pretty=format:%H|%an|%ae|%ai|%s", "--no-merges"]
@@ -774,7 +774,7 @@ class ToolExecutor:
         elif name == "pack_for_ai":
             config_file = args.get("config_file", "upload_config.yaml")
             include_git = args.get("include_git", True)
-            git_limit = int(args.get("git_limit", 10))
+            git_limit = int(args.get("git_limit", 1))
             
             config_path = self._resolve(config_file)
             
