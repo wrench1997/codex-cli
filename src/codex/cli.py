@@ -1272,6 +1272,10 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
     # 配置 prompt_toolkit key bindings
     # 默认 Enter 发送，Esc+Enter 换行（类似 ChatGPT web 界面）
     kb = KeyBindings()
+    
+    # 状态标志：跟踪用户是否移动过光标（用于决定上下键是切换历史还是移动光标）
+    cursor_moved = False
+    last_key_was_arrow = False
 
     @kb.add("enter", filter=~has_selection)
     def _submit(event):
@@ -1289,13 +1293,100 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
         data = event.app.clipboard.get_data()
         event.current_buffer.paste_clipboard_data(data)
 
+    @kb.add("up")
+    def _history_up(event):
+        """上键：
+        - 如果光标没移动过：切换历史
+        - 如果光标移动过但在第一行：切换历史
+        - 否则：在文本内向上移动光标
+        """
+        nonlocal cursor_moved, last_key_was_arrow
+        buffer = event.current_buffer
+        
+        # 检查是否在第一行（使用 cursor_position 和 document 计算）
+        # cursor_position 是字符索引，需要通过 document 转换为行号
+        doc = buffer.document
+        at_first_line = doc.cursor_position_row == 0
+        
+        if not cursor_moved or at_first_line:
+            # 切换到上一条历史
+            buffer.history_backward(count=1)
+            # 重置标志，因为已经切换到历史了
+            cursor_moved = False
+            last_key_was_arrow = True
+        else:
+            # 在文本内向上移动光标
+            buffer.cursor_up()
+            last_key_was_arrow = True
+
+    @kb.add("down")
+    def _history_down(event):
+        """下键：
+        - 如果光标没移动过：切换历史
+        - 如果光标移动过但在最后一行：切换历史
+        - 否则：在文本内向下移动光标
+        """
+        nonlocal cursor_moved, last_key_was_arrow
+        buffer = event.current_buffer
+        
+        # 检查是否在最后一行（使用 document 获取行号）
+        doc = buffer.document
+        at_last_line = doc.cursor_position_row == doc.line_count - 1
+        
+        if not cursor_moved or at_last_line:
+            # 切换到下一条历史
+            buffer.history_forward(count=1)
+            # 重置标志，因为已经切换到历史了
+            cursor_moved = False
+            last_key_was_arrow = True
+        else:
+            # 在文本内向下移动光标
+            buffer.cursor_down()
+            last_key_was_arrow = True
+
+    @kb.add("left")
+    def _cursor_left(event):
+        """左键：移动光标，并标记已移动。"""
+        nonlocal cursor_moved, last_key_was_arrow
+        event.current_buffer.cursor_left()
+        cursor_moved = True
+        last_key_was_arrow = True
+
+    @kb.add("right")
+    def _cursor_right(event):
+        """右键：移动光标，并标记已移动。"""
+        nonlocal cursor_moved, last_key_was_arrow
+        event.current_buffer.cursor_right()
+        cursor_moved = True
+        last_key_was_arrow = True
+
+    @kb.add("home")
+    def _cursor_home(event):
+        """Home 键：移动到行首，并标记已移动。"""
+        nonlocal cursor_moved
+        event.current_buffer.cursor_home()
+        cursor_moved = True
+
+    @kb.add("end")
+    def _cursor_end(event):
+        """End 键：移动到行尾，并标记已移动。"""
+        nonlocal cursor_moved
+        event.current_buffer.cursor_end()
+        cursor_moved = True
+
+    def _reset_cursor_flag():
+        """重置光标移动标志（在每次新输入开始时调用）。"""
+        nonlocal cursor_moved, last_key_was_arrow
+        cursor_moved = False
+        last_key_was_arrow = False
+
     session = PromptSession(
         history=FileHistory(HISTORY_FILE),
         style=PT_STYLE,
         key_bindings=kb,
         multiline=True,           # 支持多行输入和粘贴
         wrap_lines=True,
-        enable_history_search=True,
+        enable_history_search=False,  # 禁用默认历史搜索，使用自定义逻辑
         clipboard=SYSTEM_CLIPBOARD,  # 使用系统剪贴板
     )
 
@@ -1333,6 +1424,9 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
                 # 显示提示符
                 prompt_text = ">>> " if agent.agent_mode else "chat> "
                 
+                # 重置光标移动标志（每次新输入开始时）
+                _reset_cursor_flag()
+                
                 # ================= 核心修改区域 =================
                 if IS_CMDER:
                     # 降级方案：在 Cmder 下放弃 prompt_toolkit，使用原生 input
@@ -1356,17 +1450,26 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
             if not user_input:
                 continue
 
-            # 内置命令
-            if user_input.startswith("/"):
+            # 内置命令处理：只有 "/ "（斜杠加空格）才当作命令，否则当作文本
+            # 这样 "/help" 是命令，但 "/ 这个想法不错" 是普通文本
+            if user_input.startswith("/ "):
+                # 去掉开头的 "/ " 后作为命令处理
+                cmd = user_input[1:].strip()  # 变成 "help" 或其他
+                handled = await handle_builtin(cmd, agent)
+                if not handled:
+                    # 没有找到命令，当作文本处理
+                    agent.add_user(user_input)
+                    await _process_message(session, agent, user_input)
+            elif user_input.startswith("/"):
+                # 没有空格的 "/xxx" 形式，直接当命令处理
                 handled = await handle_builtin(user_input, agent)
                 if not handled:
                     console.print(
                         "  [yellow] 未知命令，输入 /help 查看所有命令[/yellow]"
                     )
-                continue
-
-            # AI 对话
-            await _process_message(session, agent, user_input)
+            else:
+                # AI 对话
+                await _process_message(session, agent, user_input)
 
 
 async def _process_message(
