@@ -567,15 +567,27 @@ class ToolExecutor:
                 workdir = self.workdir
             timeout = int(args.get("timeout", 60))
             cmd = args["command"]
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                cwd=workdir,
-                timeout=timeout,
-            )
+            
+            # Windows 下需要创建新的进程组，以便超时时可以终止整个进程树
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            
+            try:
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    cwd=workdir,
+                    timeout=timeout,
+                    creationflags=creationflags,
+                )
+            except subprocess.TimeoutExpired as e:
+                # 超时时尝试终止进程
+                return False, f"❌ 命令执行超时（{timeout}秒）\n\n部分输出:\nSTDOUT:\n{e.stdout or ''}\nSTDERR:\n{e.stderr or ''}"
+            
             out = ""
             if result.stdout:
                 out += f"STDOUT:\n{result.stdout}"
