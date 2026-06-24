@@ -573,20 +573,43 @@ class ToolExecutor:
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
             
+            proc = None
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     cmd,
                     shell=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                     errors="replace",
                     cwd=workdir,
-                    timeout=timeout,
                     creationflags=creationflags,
                 )
+                stdout, stderr = proc.communicate(timeout=timeout)
+                result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
             except subprocess.TimeoutExpired as e:
-                # 超时时尝试终止进程
-                return False, f"❌ 命令执行超时（{timeout}秒）\n\n部分输出:\nSTDOUT:\n{e.stdout or ''}\nSTDERR:\n{e.stderr or ''}"
+                # Windows 下需要显式终止整个进程树
+                if proc is not None and os.name == "nt":
+                    try:
+                        # 使用 taskkill 终止整个进程树（包括所有子进程）
+                        subprocess.run(
+                            f"taskkill /F /T /PID {proc.pid}",
+                            shell=True,
+                            capture_output=True,
+                            timeout=5,
+                        )
+                    except Exception:
+                        pass  # 忽略 taskkill 失败
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                # 获取已输出的内容
+                try:
+                    stdout, stderr = proc.communicate(timeout=1)
+                except Exception:
+                    stdout, stderr = "", ""
+                return False, f"❌ 命令执行超时（{timeout}秒）\n\n部分输出:\nSTDOUT:\n{stdout or ''}\nSTDERR:\n{stderr or ''}"
             
             out = ""
             if result.stdout:
