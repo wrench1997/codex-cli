@@ -39,6 +39,88 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "verify_task",
+            "description": "执行项目质量验证命令（格式化、编译、测试、git diff 检查）。在修改代码后、宣称任务完成前必须调用。返回所有验证命令的执行结果。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "acceptance_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "任务验收项列表，用于逐项核对"
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_lessons",
+            "description": "更新 agent/lessons.md，记录新发现的错误、根因和回归检查规则。当同一类错误第二次出现时自动调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "问题标题（简短描述）"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "问题描述"
+                    },
+                    "root_cause": {
+                        "type": "string",
+                        "description": "根因分析"
+                    },
+                    "rule": {
+                        "type": "string",
+                        "description": "正确规则"
+                    },
+                    "regression_check": {
+                        "type": "string",
+                        "description": "回归检查命令（bash）"
+                    }
+                },
+                "required": ["title", "description", "root_cause", "rule"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task_contract",
+            "description": "更新任务契约，记录当前任务的目标、验收项、受影响文件。在任务开始时或范围变化时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "用户目标"
+                    },
+                    "acceptance_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "验收项列表"
+                    },
+                    "not_in_scope": {
+                        "type": "string",
+                        "description": "明确不做的内容"
+                    },
+                    "affected_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "受影响的模块和文件"
+                    }
+                },
+                "required": ["goal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": "读取文件内容，支持显示行号。",
             "parameters": {
@@ -324,17 +406,17 @@ def list_tools() -> str:
         "╚═══════════════════════════════════════════════════════════╝",
         ""
     ]
-    
+
     for i, tool in enumerate(TOOLS, 1):
         func = tool["function"]
         name = func["name"]
         desc = func["description"]
         params = func["parameters"]["properties"]
         required = func["parameters"].get("required", [])
-        
+
         output.append(f"【{i:2d}】 {name}")
         output.append(f"      描述：{desc}")
-        
+
         if params:
             output.append("      参数:")
             for param_name, param_info in params.items():
@@ -345,9 +427,9 @@ def list_tools() -> str:
                 default_str = f"，默认：{default}" if default is not None else ""
                 output.append(f"        • {param_name} ({param_type}) [{req_mark}]")
                 output.append(f"          └─ {param_desc}{default_str}")
-        
+
         output.append("")
-    
+
     output.append("─" * 60)
     output.append(f"共计 {len(TOOLS)} 个工具")
     return "\n".join(output)
@@ -390,12 +472,12 @@ class ToolExecutor:
                         return True, output
                     # 如果没有对应的 VFS 工具，返回错误提示
                     return False, f"❌ VFS 模式：本地工具 '{name}' 已被禁用，请使用 MCP 虚拟文件系统工具"
-            
+
             # 如果匹配到 MCP 工具，交给 MCP 执行
             if self.mcp_manager and any(t["function"]["name"] == name for t in self.mcp_manager.get_all_tools()):
                 output = await self.mcp_manager.call_tool(name, args)
                 return True, output
-                
+
             return self._dispatch(name, args)
         except FileNotFoundError as e:
             return False, f"❌ 文件未找到: {e}"
@@ -404,7 +486,282 @@ class ToolExecutor:
         except Exception as e:
             return False, f"❌ 错误: {e}\n{traceback.format_exc()}"
 
+    def _verify_task(self, acceptance_items: list[str]) -> tuple[bool, str]:
+        """
+        执行项目质量验证。
+        读取 agent/quality.yaml，执行 format/build/test/diff-check 等命令。
+        返回验证结果。
+        """
+        import yaml
+
+        quality_path = os.path.join(self.workdir, "agent", "quality.yaml")
+        results = []
+        all_passed = True
+
+        # 尝试加载配置文件
+        if os.path.exists(quality_path):
+            try:
+                with open(quality_path, "r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+            except Exception as e:
+                return False, f"❌ 读取 quality.yaml 失败：{e}"
+        else:
+            # 默认配置
+            config = {
+                "commands": {
+                    "diff_check": {"command": "git diff --check", "required": True},
+                    "lint": {"command": "python -m py_compile src/codex/*.py gateway/*.py main.py", "required": True},
+                    "build": {"command": "python -c 'import src.codex; import gateway'", "required": False},
+                    "test": {"command": "python -m pytest tests/ -v --tb=short", "required": False},
+                },
+                "rules": [],
+                "completion": {
+                    "require_all_commands": False,
+                    "require_clean_diff_check": True,
+                    "require_acceptance_checklist": True,
+                }
+            }
+
+        commands = config.get("commands", {})
+        completion_rules = config.get("completion", {})
+        rules = config.get("rules", [])
+
+        results.append("═══ 任务验证报告 ═══\n")
+
+        # 执行验证命令
+        for cmd_name, cmd_config in commands.items():
+            command = cmd_config.get("command", "")
+            required = cmd_config.get("required", False)
+            description = cmd_config.get("description", "")
+
+            if not command:
+                continue
+
+            results.append(f"🔧 执行：{cmd_name}")
+            if description:
+                results.append(f"   说明：{description}")
+            results.append(f"   命令：{command}")
+
+            try:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    errors="replace",
+                    cwd=self.workdir,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                )
+                stdout, stderr = proc.communicate(timeout=60)
+                success = proc.returncode == 0
+
+                if success:
+                    results.append(f"   结果：✅ 通过")
+                else:
+                    results.append(f"   结果：❌ 失败 (exit={proc.returncode})")
+                    if stdout.strip():
+                        results.append(f"   输出：{stdout[:500]}")
+                    if stderr.strip():
+                        results.append(f"   错误：{stderr[:500]}")
+                    all_passed = False
+                    if required:
+                        results.append(f"   ⚠️  这是必需通过的命令")
+
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                results.append(f"   结果：❌ 超时")
+                all_passed = False
+                if required:
+                    results.append(f"   ⚠️  这是必需通过的命令")
+            except Exception as e:
+                results.append(f"   结果：❌ 执行异常：{e}")
+                all_passed = False
+
+            results.append("")
+
+        # 验收项核对
+        if acceptance_items:
+            results.append("═══ 验收项核对 ═══")
+            for i, item in enumerate(acceptance_items, 1):
+                results.append(f"  [ ] {item}")
+            results.append("")
+            results.append("⚠️  请逐项确认以上验收项是否全部完成")
+            results.append("")
+
+        # 规则提醒
+        if rules:
+            results.append("═══ 项目规则提醒 ═══")
+            for rule in rules:
+                results.append(f"  ⚠️  {rule}")
+            results.append("")
+
+        # 完成条件检查
+        completion_config = completion_rules or {}
+        require_clean_diff = completion_config.get("require_clean_diff_check", True)
+        require_all = completion_config.get("require_all_commands", False)
+
+        results.append("═══ 完成条件检查 ═══")
+        if require_clean_diff and not all_passed:
+            results.append("❌ 存在未通过的验证命令，不得宣称任务完成")
+        if require_all and not all_passed:
+            results.append("❌ 配置要求所有命令必须通过，但当前有失败项")
+
+        results.append("")
+        if all_passed:
+            results.append("✅ 所有验证通过！可以宣称任务完成。")
+        else:
+            results.append("⚠️  存在验证失败项。请修复问题后重新运行 verify_task，或明确报告未完成原因。")
+
+        return all_passed, "\n".join(results)
+
+    def _update_lessons(self, title: str, description: str, root_cause: str,
+                        rule: str, regression_check: str = "") -> tuple[bool, str]:
+        """
+        更新 agent/lessons.md，记录新发现的错误和回归规则。
+        """
+        lessons_path = os.path.join(self.workdir, "agent", "lessons.md")
+
+        # 确保目录存在
+        os.makedirs(os.path.dirname(lessons_path), exist_ok=True)
+
+        # 生成新条目
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        new_entry = f"""
+### {title}
+
+- **出现日期**: {today}
+- **问题描述**: {description}
+- **根因**: {root_cause}
+- **正确规则**: {rule}
+- **回归检查**:
+  ```bash
+  {regression_check if regression_check else '# 暂无具体检查命令'}
+  ```
+"""
+
+        # 如果文件不存在，创建基础结构
+        if not os.path.exists(lessons_path):
+            header = """# 项目教训与回归规则
+
+本文档记录本项目已踩过的坑、已修复的错误和不可复发的规则。
+
+**规则优先级高于临时推测**。当遇到类似问题时，先查阅本文档。
+
+---
+
+## 已记录规则
+
+"""
+            with open(lessons_path, "w", encoding="utf-8") as f:
+                f.write(header + new_entry)
+            return True, f"✅ 已创建 lessons.md 并添加新规则：{title}"
+
+        # 读取现有内容
+        try:
+            with open(lessons_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            return False, f"❌ 读取 lessons.md 失败：{e}"
+
+        # 检查是否已存在相同标题的规则
+        if f"### {title}" in content:
+            return False, f"⚠️  规则 '{title}' 已存在，避免重复添加"
+
+        # 找到"## 已记录规则"的位置，在其后插入
+        marker = "## 已记录规则"
+        if marker in content:
+            # 找到 marker 所在行的末尾
+            idx = content.find(marker) + len(marker)
+            # 跳过可能的空白行
+            while idx < len(content) and content[idx] in '\n\r':
+                idx += 1
+            # 插入新条目
+            new_content = content[:idx] + "\n" + new_entry + content[idx:]
+        else:
+            # 没有 marker，追加到末尾
+            new_content = content + "\n" + new_entry
+
+        # 写回文件
+        try:
+            with open(lessons_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            return True, f"✅ 已更新 lessons.md，添加规则：{title}"
+        except Exception as e:
+            return False, f"❌ 写入 lessons.md 失败：{e}"
+
+    def _update_task_contract(self, goal: str, acceptance_items: list[str] = None,
+                               not_in_scope: str = "", affected_files: list[str] = None) -> tuple[bool, str]:
+        """
+        更新任务契约文件 (.codex/task.json)。
+        """
+        import json
+
+        task_dir = os.path.join(self.workdir, ".codex")
+        task_file = os.path.join(task_dir, "task.json")
+
+        # 确保目录存在
+        os.makedirs(task_dir, exist_ok=True)
+
+        # 读取现有契约（如果有）
+        contract = {}
+        if os.path.exists(task_file):
+            try:
+                with open(task_file, "r", encoding="utf-8") as f:
+                    contract = json.load(f)
+            except Exception:
+                contract = {}
+
+        # 更新契约
+        contract["goal"] = goal
+        if acceptance_items:
+            contract["acceptance"] = acceptance_items
+        if not_in_scope:
+            contract["not_in_scope"] = not_in_scope
+        if affected_files:
+            contract["affected_files"] = affected_files
+
+        # 更新状态
+        contract["status"] = "implementing"
+        if "changed_files" not in contract:
+            contract["changed_files"] = []
+        if "verification" not in contract:
+            contract["verification"] = {"required": [], "passed": []}
+
+        # 写回文件
+        try:
+            with open(task_file, "w", encoding="utf-8") as f:
+                json.dump(contract, f, indent=2, ensure_ascii=False)
+            return True, f"✅ 已更新任务契约：{goal[:50]}..."
+        except Exception as e:
+            return False, f"❌ 写入 task.json 失败：{e}"
+
     def _dispatch(self, name: str, args: dict) -> tuple[bool, str]:
+        # ── verify_task ─────────────────────────────────
+        if name == "verify_task":
+            return self._verify_task(args.get("acceptance_items", []))
+
+        # ── update_lessons ─────────────────────────────────
+        if name == "update_lessons":
+            return self._update_lessons(
+                title=args.get("title", ""),
+                description=args.get("description", ""),
+                root_cause=args.get("root_cause", ""),
+                rule=args.get("rule", ""),
+                regression_check=args.get("regression_check", "")
+            )
+
+        # ── update_task_contract ─────────────────────────────────
+        if name == "update_task_contract":
+            return self._update_task_contract(
+                goal=args.get("goal", ""),
+                acceptance_items=args.get("acceptance_items", []),
+                not_in_scope=args.get("not_in_scope", ""),
+                affected_files=args.get("affected_files", [])
+            )
+
         # ── read_file ──────────────────────────────────
         if name == "read_file":
             path = self._resolve(args["path"])
@@ -529,36 +886,36 @@ class ToolExecutor:
             )
             if not hits:
                 return True, "🔍 未找到匹配结果。"
-            
+
             # 提取统计信息
             stats = hits[0].pop("_stats", None) if hits else None
             stats_str = f"\n\n📊 统计：搜索了 {stats['files_searched']} 个文件，{stats['files_matched']} 个文件包含匹配项" if stats else ""
-            
+
             lines = [f"🔍 找到 {len(hits)} 处匹配:{stats_str}\n"]
             for h in hits:
                 ctx_before = h.get("context_before", [])
                 ctx_after = h.get("context_after", [])
                 rel_path = h.get("rel_path", h['file'])
-                
+
                 # 构建带上下文的输出
                 entry_lines = []
                 entry_lines.append(f"  📁 {rel_path}:{h['line_no']}")
-                
+
                 # 显示上下文前
                 if ctx_before:
                     for i, ctx_line in enumerate(ctx_before, 1):
                         entry_lines.append(f"     {h['line_no'] - len(ctx_before) + i - 1}: {ctx_line}")
-                
+
                 # 显示匹配行（高亮）
                 entry_lines.append(f"  → {h['line_no']}: {h['line'].strip()}")
-                
+
                 # 显示上下文后
                 if ctx_after:
                     for i, ctx_line in enumerate(ctx_after, 1):
                         entry_lines.append(f"     {h['line_no'] + i}: {ctx_line}")
-                
+
                 lines.append("\n".join(entry_lines))
-            
+
             return True, "\n".join(lines)
 
         # ── list_directory ─────────────────────────────
@@ -578,12 +935,12 @@ class ToolExecutor:
                 workdir = self.workdir
             timeout = int(args.get("timeout", 60))
             cmd = args["command"]
-            
+
             # Windows 下需要创建新的进程组，以便超时时可以终止整个进程树
             creationflags = 0
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-            
+
             proc = None
             try:
                 proc = subprocess.Popen(
@@ -621,7 +978,7 @@ class ToolExecutor:
                 except Exception:
                     stdout, stderr = "", ""
                 return False, f"❌ 命令执行超时（{timeout}秒）\n\n部分输出:\nSTDOUT:\n{stdout or ''}\nSTDERR:\n{stderr or ''}"
-            
+
             out = ""
             if result.stdout:
                 out += f"STDOUT:\n{result.stdout}"
@@ -641,11 +998,11 @@ class ToolExecutor:
         elif name == "git_log":
             limit = int(args.get("limit", 1))
             author = args.get("author", "")
-            
+
             cmd = ["git", "log", f"-{limit}", "--pretty=format:%H|%an|%ae|%ai|%s", "--no-merges"]
             if author:
                 cmd.extend(["--author", author])
-            
+
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.workdir)
                 commits = []
@@ -660,15 +1017,15 @@ class ToolExecutor:
                                 "date": parts[3],
                                 "message": parts[4]
                             })
-                
+
                 if not commits:
                     return True, "📝 没有找到提交记录"
-                
+
                 output = [f"📜 最近 {len(commits)} 条提交历史:\n"]
                 for i, c in enumerate(commits, 1):
                     output.append(f"[{i}] {c['hash'][:8]} | {c['author']} | {c['date'][:10]}")
                     output.append(f"    └─ {c['message']}")
-                
+
                 return True, "\n".join(output)
             except subprocess.CalledProcessError as e:
                 return False, f"❌ git log 失败：{e}"
@@ -678,7 +1035,7 @@ class ToolExecutor:
             commit_hash = args["commit_hash"]
             max_lines = int(args.get("max_lines", 500))
             show_source = args.get("show_source", False)  # 是否显示修改后的完整源代码
-            
+
             try:
                 # 第一步：获取提交信息和 diff
                 result = subprocess.run(
@@ -688,21 +1045,21 @@ class ToolExecutor:
                     check=True,
                     cwd=self.workdir
                 )
-                
+
                 output_parts = []
                 output_parts.append("=" * 80)
                 output_parts.append(f"📝 Commit: {commit_hash}")
                 output_parts.append("=" * 80)
                 output_parts.append("")
-                
+
                 # 解析输出，分离 commit 信息和文件改动统计
                 raw_lines = result.stdout.split("\n")
-                
+
                 # 提取 commit 信息（到第一个 diff --git 之前）
                 commit_info_lines = []
                 changed_files = []
                 in_diff = False
-                
+
                 for line in raw_lines:
                     if line.startswith("diff --git"):
                         in_diff = True
@@ -714,7 +1071,7 @@ class ToolExecutor:
                             changed_files.append(file_path)
                     if not in_diff:
                         commit_info_lines.append(line)
-                
+
                 # 添加 commit 信息
                 output_parts.extend(commit_info_lines)
                 output_parts.append("")
@@ -723,13 +1080,13 @@ class ToolExecutor:
                 for f in changed_files:
                     output_parts.append(f"  • {f}")
                 output_parts.append("")
-                
+
                 # 如果 show_source 为 True，读取并显示修改后的文件内容
                 if show_source and changed_files:
                     output_parts.append("=" * 80)
                     output_parts.append("📄 修改后的源代码内容:")
                     output_parts.append("=" * 80)
-                    
+
                     for file_path in changed_files:
                         full_path = self._resolve(file_path)
                         if os.path.exists(full_path):
@@ -747,14 +1104,14 @@ class ToolExecutor:
                         else:
                             output_parts.append(f"⚠️  文件已删除或不存在：{file_path}")
                     output_parts.append("")
-                
+
                 # 添加详细 diff（如果空间允许）
                 remaining_lines = max_lines - len(output_parts)
                 if remaining_lines > 50:
                     output_parts.append("=" * 80)
                     output_parts.append("📝 详细 Diff:")
                     output_parts.append("=" * 80)
-                    
+
                     # 重新获取带完整 diff 的输出
                     diff_result = subprocess.run(
                         ["git", "show", "-p", commit_hash],
@@ -764,19 +1121,19 @@ class ToolExecutor:
                         cwd=self.workdir
                     )
                     diff_lines = diff_result.stdout.split("\n")
-                    
+
                     if len(diff_lines) > remaining_lines:
                         output_parts.extend(diff_lines[:remaining_lines])
                         output_parts.append(f"\n... (diff 被截断，共超过 {remaining_lines} 行)")
                     else:
                         output_parts.extend(diff_lines)
-                
+
                 final_output = "\n".join(output_parts)
                 if len(final_output.split("\n")) > max_lines:
                     final_lines = final_output.split("\n")[:max_lines]
                     final_lines.append(f"\n... (总输出被截断，共超过 {max_lines} 行)")
                     final_output = "\n".join(final_lines)
-                
+
                 return True, final_output
             except subprocess.CalledProcessError as e:
                 return False, f"❌ git show 失败：{e}"
@@ -784,12 +1141,12 @@ class ToolExecutor:
         # ── git_status ─────────────────────────────────
         elif name == "git_status":
             show_untracked = args.get("show_untracked", True)
-            
+
             try:
                 cmd = ["git", "status"]
                 if not show_untracked:
                     cmd.append("--untracked-files=no")
-                
+
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.workdir)
                 return True, f"📝 Git 工作区状态:\n{result.stdout}"
             except subprocess.CalledProcessError as e:
@@ -799,19 +1156,19 @@ class ToolExecutor:
         elif name == "git_diff":
             target = args.get("target", "")
             cached = args.get("cached", False)
-            
+
             try:
                 cmd = ["git", "diff"]
                 if cached:
                     cmd.append("--cached")
                 if target:
                     cmd.append(target)
-                
+
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.workdir)
-                
+
                 if not result.stdout.strip():
                     return True, "📝 没有差异"
-                
+
                 return True, f"📊 Git 差异:\n{result.stdout}"
             except subprocess.CalledProcessError as e:
                 return False, f"❌ git diff 失败：{e}"
@@ -821,15 +1178,15 @@ class ToolExecutor:
             config_file = args.get("config_file", "upload_config.yaml")
             include_git = args.get("include_git", True)
             git_limit = int(args.get("git_limit", 1))
-            
+
             config_path = self._resolve(config_file)
-            
+
             if not os.path.exists(config_path):
                 return False, f"❌ 配置文件不存在：{config_path}"
-            
+
             # 导入 pack_for_ai 模块（内置在 src.codex.pack_for_ai）
             from src.codex.pack_for_ai import pack_for_ai as pack_func
-            
+
             # 执行打包（传入当前工作目录，确保 git 命令在正确的项目目录执行）
             output_file = pack_func(
                 config_path=config_path,
@@ -837,7 +1194,7 @@ class ToolExecutor:
                 git_limit=git_limit,
                 cwd=self.workdir  # 使用工具执行器的工作目录
             )
-            
+
             if output_file:
                 return True, f"✅ 打包完成！\n输出文件：{output_file}\n\n可以直接发送这个文件给其他 AI 求助。"
             else:
@@ -847,15 +1204,15 @@ class ToolExecutor:
         elif name == "export_commit":
             commit_hash = args["commit_hash"]
             output_file = args.get("output_file", "")
-            
+
             # 导入 pack_for_ai 模块（内置在 src.codex.pack_for_ai）
             from src.codex.pack_for_ai import export_single_commit
-            
+
             if not output_file:
                 output_file = f"commit_{commit_hash[:8]}.txt"
-            
+
             result_file = export_single_commit(commit_hash, output_file)
-            
+
             if result_file:
                 return True, f"✅ 已导出 commit {commit_hash[:8]}\n文件：{result_file}\n\n可以发送这个文件给 AI 询问具体改动。"
             else:

@@ -1,0 +1,40 @@
+# 项目质量门禁配置
+# 用于 verify_task 工具自动执行验证命令
+
+commands:
+  # Git 差异检查（必须）
+  diff_check:
+    command: "git diff --check"
+    required: true
+    description: "检查是否有 whitespace 错误或合并冲突标记"
+
+  # Zig 代码检查
+  lint:
+    command: "zig ast-check src/*.zig src/core/*.zig src/ecs/*.zig src/ecs/systems/*.zig src/ecs/components/*.zig"
+    required: true
+    description: "Zig 语法检查"
+
+  # Zig 构建检查
+  build:
+    command: "zig build --summary all"
+    required: true
+    description: "Zig 项目构建"
+
+  # 格式化检查
+  format_check:
+    command: "zig fmt --check src/"
+    required: false
+    description: "检查 Zig 代码格式"
+
+rules:
+  - "禁止为了通过编译删除功能或吞掉错误"
+  - "禁止新增 TODO、pass、空实现、mock 代替真实逻辑"
+  - "修改公共类型后必须检查所有引用"
+  - "修改脚本语法后必须运行对应 parser/compiler 测试"
+  - "最小改动是手段，不是目标 —— 不得以少改为理由遗漏验收项"
+
+completion:
+  require_all_commands: false   # 不强制所有命令都成功（有些项目可能没有测试）
+  require_clean_diff_check: true
+  require_acceptance_checklist: true
+  require_verification_before_done: true  # 关键：修改后必须验证才能说完成

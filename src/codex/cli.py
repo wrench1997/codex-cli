@@ -54,7 +54,56 @@ from src.codex.tools import TOOLS, ToolExecutor
 from src.codex.mcp.manager import McpManager
 
 
-    
+# ──────────────────────────────────────────────
+# 任务状态跟踪（用于防止"未验证就宣称完成"）
+# ──────────────────────────────────────────────
+
+class TaskState:
+    """
+    跟踪当前任务的状态，确保修改后必须验证才能结束。
+    """
+    def __init__(self):
+        self.dirty = False                    # 是否改过代码
+        self.acceptance_items: list[str] = []  # 验收项列表
+        self.changed_files: set[str] = set()   # 已修改的文件
+        self.verification_passed = False       # 验证是否通过
+        self.status = "idle"                   # idle / implementing / verifying / done
+
+    def mark_modified(self, files: list[str]):
+        """标记代码已被修改"""
+        self.dirty = True
+        self.changed_files.update(files)
+        self.status = "implementing"
+        self.verification_passed = False
+
+    def set_acceptance_items(self, items: list[str]):
+        """设置验收项"""
+        self.acceptance_items = items
+
+    def mark_verified(self, passed: bool):
+        """标记验证结果"""
+        self.verification_passed = passed
+        if passed:
+            self.status = "done"
+        else:
+            self.status = "verifying"
+
+    def can_finish(self) -> bool:
+        """检查是否满足完成条件"""
+        if not self.dirty:
+            return True  # 没改过代码，可以直接结束
+        return self.verification_passed
+
+    def reset(self):
+        """重置状态"""
+        self.dirty = False
+        self.acceptance_items = []
+        self.changed_files = set()
+        self.verification_passed = False
+        self.status = "idle"
+
+
+
 # ──────────────────────────────────────────────
 # 全局 Console
 # ──────────────────────────────────────────────
@@ -159,15 +208,15 @@ IS_CMDER = _is_cmder()
 if sys.platform == "win32" and _is_cmder():
     print("禁用VT100")
     os.environ["PROMPT_TOOLKIT_NO_VT100"] = "1"
-    
-    
+
+
 
 # ==================== 新增以下几行 ====================
 if IS_CMDER:
     # 强制让 prompt_toolkit 不使用 ConEmu 的 ANSI 注入器
     # 这通常能解决 Cmder 下中文光标乱跳的问题
     os.environ["PROMPT_TOOLKIT_NO_CONEMU_ANSI"] = "1"
-    
+
 
 def _copy_to_system_clipboard(text: str) -> None:
     """尽量把文本写入系统剪贴板。"""
@@ -379,6 +428,29 @@ HELP_TEXT = """
 | `/compress`     | 手动压缩并归纳历史上下文 |
 | `/exit`         | 退出 |
 
+## 命令行参数
+
+```bash
+python codex.py                          # 交互式 REPL（默认）
+python codex.py "帮我重构 main.py"        # 单次任务后进入 REPL
+python codex.py -y "修复所有 TODO"        # 自动审批模式
+python codex.py --dir /path/to/project   # 指定工作目录
+python codex.py --no-agent               # 纯聊天模式（不加载工具）
+```
+
+## AI 工具
+
+在 Agent 模式下，AI 可以自动调用以下工具完成任务：
+
+- **verify_task** - 执行质量验证（编译、测试、git diff 检查）
+- **update_lessons** - 更新 agent/lessons.md，记录错误和回归规则
+- **update_task_contract** - 更新任务契约，记录目标和验收项
+- **read_file / write_file / search_replace** - 文件编辑
+- **execute_shell** - 执行 shell 命令
+- **git_*** - Git 操作相关工具
+
+使用 `/tools` 命令查看完整工具列表和参数说明。
+
 ## 输入技巧
 
 - **多行输入**: 按 `Esc+Enter` 换行，`Enter` 发送
@@ -503,7 +575,7 @@ async def ask_approval(path_line: str, diff_text: str) -> tuple[bool, Optional[s
         loop = asyncio.get_running_loop()
         answer = await loop.run_in_executor(None, sys.stdin.readline)
         answer = answer.strip().lower()
-        
+
         if answer in ("y", "yes", "a", ""):
             return True, None
         elif answer in ("n", "no"):
@@ -674,7 +746,9 @@ class ChatAgent:
             f"You are Codex, an expert AI coding assistant embedded in a developer's terminal. "
             f"You have access to the user's codebase and can read, write, search, and modify files. "
             f"You maintain context across the entire conversation. "
-            f"Always prefer minimal, targeted edits over full rewrites. "
+            f"Always prefer the SMALLEST change that FULLY satisfies every acceptance criterion. "
+            f"Never reduce scope, omit edge cases, or skip verification merely to keep changes small. "
+            f"Minimal edits are a MEANS, not a GOAL — completeness and correctness come first. "
             f"Explain your reasoning and actions in Chinese. "
             f"Be concise but thorough. "
             f"When the user asks follow-up questions, refer to the previous context naturally. "
@@ -685,7 +759,16 @@ class ChatAgent:
             f"If you encounter a question you cannot answer or a task you cannot complete, "
             f"be honest and say so directly. Do not make up answers or give vague responses. "
             f"Instead, clearly state what you don't know, and invite the user to provide more context "
-            f"or offer their own solution. It's okay to admit limitations."
+            f"or offer their own solution. It's okay to admit limitations.\n\n"
+            f"## Critical Rules:\n"
+            f"1. After modifying ANY code, you MUST call `verify_task` tool before claiming completion.\n"
+            f"2. Never claim 'done' or 'fixed' without actually running verification commands.\n"
+            f"3. If verification fails, fix the issues and re-run verification.\n"
+            f"4. Read agent/skills.md for engineering discipline rules.\n"
+            f"5. Read agent/lessons.md for project-specific gotchas and non-regression rules.\n"
+            f"6. Read agent/quality.yaml for required build/test/lint commands.\n"
+            f"7. When starting a task, call `update_task_contract` to record goal and acceptance criteria.\n"
+            f"8. When encountering a repeated error, call `update_lessons` to record the root cause and regression rule.\n"
         ]
 
         # 读取 agent/skills.md 作为额外的技能提示词（如果存在）
@@ -712,9 +795,12 @@ class ChatAgent:
 
         # 完整对话历史（包含 system）
         self.input_items: list[dict] = [self.system_item]
-        
+
         # 长期记忆（上下文压缩后生成的核心记忆点）
         self.memory_summary = ""
+
+        # 任务状态跟踪（防止未验证就宣称完成）
+        self.task_state = TaskState()
 
     # ── 历史管理 ──────────────────────────────────────────
 
@@ -723,6 +809,7 @@ class ChatAgent:
         self.input_items = [self.system_item]
         self.turn_count = 0
         self.tool_call_count = 0
+        self.task_state.reset()
 
     def add_user(self, text: str):
         self.input_items.append({
@@ -790,7 +877,7 @@ class ChatAgent:
             "stream": False,
             "temperature": 0.1,  # 总结任务需要低温度，保证客观真实
         }
-        
+
         headers = {}
         if CONFIG.api_key and CONFIG.api_key != "dummy":
             headers["Authorization"] = f"Bearer {CONFIG.api_key}"
@@ -810,7 +897,7 @@ class ChatAgent:
                     return output_items[0]["content"][0]["text"]
         except Exception as e:
             return f"（压缩上下文失败，错误：{e}）"
-            
+
         return "（未生成有效总结）"
 
     async def compress_context(self):
@@ -827,7 +914,7 @@ class ChatAgent:
         recent_msgs = self.input_items[-keep_items:]
         # 中间的是需要被压缩的旧消息
         old_msgs = self.input_items[1:-keep_items]
-        
+
         # 将历史记忆转为文本格式供模型阅读
         history_lines = []
         for item in old_msgs:
@@ -838,12 +925,12 @@ class ChatAgent:
             if len(content_str) > 1000:
                 content_str = content_str[:1000] + "\n...(内容过长截断)..."
             history_lines.append(f"[{role}]: {content_str}")
-        
+
         history_text = "\n\n".join(history_lines)
 
         # 3. 调用模型生成新的总结
         new_summary = await self._generate_summary(history_text)
-        
+
         # 4. 如果之前已经有记忆了，把旧记忆合并到新记忆的开头（滚动迭代）
         if self.memory_summary:
             self.memory_summary = f"{new_summary}\n\n(上期残留记忆:\n{self.memory_summary[:500]})"
@@ -856,7 +943,7 @@ class ChatAgent:
             "role": "system",
             "content": f"【系统提示：之前的历史对话已压缩为核心记忆】\n\n{self.memory_summary}\n\n请在后续回答中基于上述记忆推进工作。"
         }
-        
+
         self.input_items = [system_msg, memory_msg] + recent_msgs
 
     # ── HTTP 流式调用 ──────────────────────────────────────
@@ -908,7 +995,7 @@ class ChatAgent:
                         # 检查取消事件
                         if cancel_event and cancel_event.is_set():
                             raise asyncio.CancelledError("用户取消了生成")
-                        
+
                         if not line or not line.startswith("data:"):
                             continue
                         data = line[5:].strip()
@@ -958,6 +1045,8 @@ class ChatAgent:
         - 支持多次工具调用循环
         - 自动将工具结果追加进历史
         - 返回最终文本回复
+
+        关键增强：修改代码后必须验证才能结束任务
         """
         # ==== 新增：在每轮开始前检查是否需要压缩上下文 ====
         current_tokens = self.estimate_tokens()
@@ -966,7 +1055,7 @@ class ChatAgent:
             await self.compress_context()
             console.print("[bold green]✅ 记忆压缩完成，已释放多余上下文！[/bold green]\n")
         # ===================================================
-        
+
         self.turn_count += 1
 
         for _loop in range(CONFIG.max_turns):
@@ -981,8 +1070,23 @@ class ChatAgent:
                 if item.get("type") == "function_call"
             ]
 
-            # 没有工具调用 → 这轮结束
+            # 没有工具调用 → 检查是否可以结束
             if not tool_calls:
+                # 关键门禁：如果代码已修改但未验证，强制要求验证
+                if self.task_state.dirty and not self.task_state.can_finish():
+                    # 自动插入系统消息，要求模型执行验证
+                    self.add_assistant(visible_text)
+                    self.add_user(
+                        "【系统门禁】⚠️  检测到代码已修改但尚未通过验证。\n\n"
+                        "根据工程执行协议，你必须：\n"
+                        "1. 调用 `verify_task` 工具执行质量验证命令\n"
+                        "2. 或明确报告未完成原因和阻塞问题\n\n"
+                        f"已修改的文件：{', '.join(self.task_state.changed_files)}\n"
+                        f"验收项：{self.task_state.acceptance_items if self.task_state.acceptance_items else '（未设置）'}\n\n"
+                        "**不得宣称任务完成，直到验证通过或明确说明未完成。**"
+                    )
+                    continue  # 继续循环，让模型回应
+
                 # 把 assistant 回复加入历史
                 self.add_assistant(visible_text)
                 return visible_text
@@ -1002,6 +1106,8 @@ class ChatAgent:
 
             # ── 逐个执行工具 ──────────────────────────────
             user_rejected = False  # 标记是否有用户拒绝的操作
+            modified_files: list[str] = []  # 跟踪本轮修改的文件
+
             for item in tool_calls:
                 name, args, call_id = _extract_function_call(item)
                 self.tool_call_count += 1
@@ -1010,6 +1116,14 @@ class ChatAgent:
                     await on_tool_call(name, args)
 
                 success, output = await self.executor.execute(name, args)
+
+                # 跟踪文件修改（用于任务状态）
+                write_tools = ["write_file", "search_replace", "insert_lines", "delete_lines", "replace_lines", "apply_patch"]
+                if name in write_tools and success and not output.startswith("__PENDING_WRITE__"):
+                    # 提取被修改的文件路径
+                    path_arg = args.get("path", "")
+                    if path_arg:
+                        modified_files.append(path_arg)
 
                 # 处理需要审批的写操作
                 if output.startswith("__PENDING_WRITE__"):
@@ -1027,6 +1141,10 @@ class ChatAgent:
                         self.executor.auto_approve = True
                         success, output = await self.executor.execute(name, args)
                         self.executor.auto_approve = old_auto
+                        # 跟踪修改的文件
+                        path_arg = args.get("path", "")
+                        if path_arg:
+                            modified_files.append(path_arg)
                     else:
                         # 用户拒绝：直接跳出工具循环，回到正常对话
                         user_rejected = True
@@ -1046,6 +1164,10 @@ class ChatAgent:
 
                 # 把工具结果加入历史
                 self.add_tool_result(call_id, output)
+
+            # 更新任务状态：如果有文件被修改
+            if modified_files:
+                self.task_state.mark_modified(modified_files)
 
             # 如果用户拒绝了操作，直接结束这轮对话，让 AI 给用户回复空间
             if user_rejected:
@@ -1175,7 +1297,7 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
             return True
 
     if command == "/tools":
-        from tools import list_tools
+        from src.codex.tools import list_tools
         console.print(Panel(
             list_tools(),
             title="🛠️ 可用工具",
@@ -1192,7 +1314,7 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
                 f"服务器数量：[bold]{len(servers)}[/bold]\n"
                 f"工具数量：[bold]{len(tools)}[/bold]\n\n"
                 f"服务器列表:\n"
-                + "\n".join(f"  • {name}: {'[green]运行中[/green]' if server.is_started() else '[red]已停止[/red]'}" 
+                + "\n".join(f"  • {name}: {'[green]运行中[/green]' if server.is_started() else '[red]已停止[/red]'}"
                            for name, server in servers.items())
                 + (f"\n\nMCP 工具列表:\n" + "\n".join(f"  • {tool.get('function', {}).get('name', 'unknown')}" for tool in tools) if tools else "\n[dim]暂无 MCP 工具[/dim]"),
                 title="🔌 MCP 状态",
@@ -1258,6 +1380,18 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
         console.print("[green]压缩完成！使用 /memory 查看提取的关键记忆点。[/green]")
         return True
 
+    if command == "/verify":
+        # 手动触发任务验证
+        console.print("[yellow]手动触发任务验证...[/yellow]")
+        success, output = await agent.executor.execute("verify_task", {"acceptance_items": agent.task_state.acceptance_items})
+        console.print(Panel(
+            output,
+            title="🛡️ 任务验证报告",
+            border_style="green" if success else "red"
+        ))
+        agent.task_state.mark_verified(success)
+        return True
+
     return False
 
 
@@ -1273,7 +1407,7 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
     # 配置 prompt_toolkit key bindings
     # 默认 Enter 发送，Esc+Enter 换行（类似 ChatGPT web 界面）
     kb = KeyBindings()
-    
+
     # 状态标志：跟踪用户是否移动过光标（用于决定上下键是切换历史还是移动光标）
     cursor_moved = False
     last_key_was_arrow = False
@@ -1303,12 +1437,12 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
         """
         nonlocal cursor_moved, last_key_was_arrow
         buffer = event.current_buffer
-        
+
         # 检查是否在第一行（使用 cursor_position 和 document 计算）
         # cursor_position 是字符索引，需要通过 document 转换为行号
         doc = buffer.document
         at_first_line = doc.cursor_position_row == 0
-        
+
         if not cursor_moved or at_first_line:
             # 切换到上一条历史
             buffer.history_backward(count=1)
@@ -1329,11 +1463,11 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
         """
         nonlocal cursor_moved, last_key_was_arrow
         buffer = event.current_buffer
-        
+
         # 检查是否在最后一行（使用 document 获取行号）
         doc = buffer.document
         at_last_line = doc.cursor_position_row == doc.line_count - 1
-        
+
         if not cursor_moved or at_last_line:
             # 切换到下一条历史
             buffer.history_forward(count=1)
@@ -1424,10 +1558,10 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
             try:
                 # 显示提示符
                 prompt_text = ">>> " if agent.agent_mode else "chat> "
-                
+
                 # 重置光标移动标志（每次新输入开始时）
                 _reset_cursor_flag()
-                
+
                 # ================= 核心修改区域 =================
                 if IS_CMDER:
                     # 降级方案：在 Cmder 下放弃 prompt_toolkit，使用原生 input
@@ -1439,7 +1573,7 @@ async def repl(agent: ChatAgent, initial_task: Optional[str] = None):
                     # 正常方案：其他终端继续使用高级多行输入
                     user_input = await session.prompt_async(prompt_text, style=PT_STYLE)
                 # ================================================
-                
+
             except KeyboardInterrupt:
                 console.print("\n  [dim](Ctrl+C - 使用 /exit 或 Ctrl+D 退出)[/dim]")
                 continue
@@ -1562,7 +1696,7 @@ async def _process_message(
     try:
         # 启动后台任务监听 Esc 键
         esc_listener_task = asyncio.create_task(listen_for_esc())
-        
+
         final_text = await agent.run_turn(
             on_token=on_token,
             on_tool_call=on_tool_call,
@@ -1570,7 +1704,7 @@ async def _process_message(
             on_pending=on_pending,
             cancel_event=cancel_event,
         )
-        
+
         # 生成完成，停止监听
         is_generating = False
         esc_listener_task.cancel()
@@ -1681,13 +1815,13 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
 
     async def _main_async():
         mcp_manager = None
-        
+
         # ==================== VFS 模式：从配置文件加载并自动启动 Electron ====================
         if vfs_mode:
             console.print(f"\n[bold cyan]🚀 正在启动 VFS 模式（虚拟文件系统专业模式）...[/bold cyan]")
             console.print(f"[dim]  配置：从 mcp_config.yaml 加载 rjcut_vfs 服务器[/dim]")
             console.print(f"[dim]  功能：自动启动 Electron 应用 + 连接 MCP 服务器 + 屏蔽本地文件工具[/dim]\n")
-            
+
             # 确定配置文件路径
             config_path = mcp_config
             if not config_path:
@@ -1701,18 +1835,18 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
                     # 尝试脚本所在目录
                     script_dir = os.path.dirname(os.path.abspath(__file__))
                     config_path = os.path.join(script_dir, "mcp_config.yaml")
-            
+
             if os.path.exists(config_path):
                 console.print(f"[dim]  加载配置文件：{config_path}[/dim]")
                 # 使用 VFS 模式加载配置（只加载 rjcut_vfs 服务器）
                 mcp_manager = McpManager.from_config(config_path, vfs_mode=True)
-                
+
                 if mcp_manager.servers:
                     # 启动 MCP 服务器（会自动启动 Electron 应用）
                     console.print(f"[dim]  正在启动 MCP 服务器...[/dim]")
                     results = await mcp_manager.start_all()
                     success_count = sum(1 for v in results.values() if v)
-                    
+
                     if success_count > 0:
                         all_tools = mcp_manager.get_all_tools()
                         console.print(f"\n[green]✅ VFS MCP 服务器已连接，加载了 {len(all_tools)} 个虚拟文件系统工具[/green]")
@@ -1727,7 +1861,7 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
                     console.print("[yellow]⚠️  配置文件中未找到 rjcut_vfs 服务器配置[/yellow]")
             else:
                 console.print(f"[red]❌ 配置文件不存在：{config_path}[/red]")
-        
+
         # ==================== 普通 MCP 模式 ====================
         elif mcp or mcp_config:
             config_path = mcp_config
@@ -1742,10 +1876,10 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
                     # 尝试脚本所在目录
                     script_dir = os.path.dirname(os.path.abspath(__file__))
                     config_path = os.path.join(script_dir, "mcp_config.yaml")
-            
+
             console.print(f"[dim]正在从配置文件加载 MCP 服务：{config_path}[/dim]")
             mcp_manager = McpManager.from_config(config_path)
-            
+
             if mcp_manager.servers:
                 results = await mcp_manager.start_all()
                 success_count = sum(1 for v in results.values() if v)
@@ -1771,7 +1905,7 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
 
             initial = " ".join(task) if task else None
             await repl(agent, initial_task=initial)
-            
+
         finally:
             if mcp_manager:
                 await mcp_manager.close_all()

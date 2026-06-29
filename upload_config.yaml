@@ -7,11 +7,15 @@ include:
   - "main.py"
   - "count_src_lines_yaml.py"
   - "pack_for_ai.py"
-  
+
   # 📄 配置文件和文档
   - "*.yaml"
   - "*.md"
   - "docs/*.md"
+
+  # 🛡️ 工程执行协议（重要！）
+  - "agent/*.md"
+  - "agent/*.yaml"
 
 # Git 设置（可选）
 git_settings:
