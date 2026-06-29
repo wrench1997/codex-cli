@@ -23,6 +23,14 @@ from src.codex.file_editor import (
     write_file,
 )
 
+# 可选的 SSH 远程模块
+try:
+    from src.codex.remote import remote_manager, get_remote_tools, REMOTE_AVAILABLE
+except ImportError:
+    remote_manager = None
+    get_remote_tools = lambda: []
+    REMOTE_AVAILABLE = False
+
 # ──────────────────────────────────────────────
 # 工具 Schema（发给模型）
 # ──────────────────────────────────────────────
@@ -300,6 +308,9 @@ TOOLS: list[dict] = [
         },
     },
 ]
+
+# 添加 SSH 远程工具（如果模块可用）
+TOOLS.extend(get_remote_tools())
 
 # ──────────────────────────────────────────────
 # 工具集列表函数
@@ -849,6 +860,56 @@ class ToolExecutor:
                 return True, f"✅ 已导出 commit {commit_hash[:8]}\n文件：{result_file}\n\n可以发送这个文件给 AI 询问具体改动。"
             else:
                 return False, f"❌ 导出失败，请检查 commit hash 是否正确：{commit_hash}"
+# ── SSH 远程工具 ─────────────────────────────────
+        elif REMOTE_AVAILABLE and remote_manager:
+            if name == "connect_remote":
+                return remote_manager.connect(**args)
+            elif name == "read_remote_file":
+                conn = remote_manager.get_conn()
+                if not conn:
+                    return False, "未连接到远程主机，请先执行 connect_remote"
+                try:
+                    result = conn.run(f"cat '{args['path']}'", hide=True, timeout=30)
+                    return True, result.stdout
+                except Exception as e:
+                    return False, f"读取失败：{str(e)}"
+            elif name == "write_remote_file":
+                conn = remote_manager.get_conn()
+                if not conn:
+                    return False, "未连接到远程主机"
+                try:
+                    import io
+                    binary_content = args["content"].replace("\r\n", "\n").encode("utf-8")
+                    file_obj = io.BytesIO(binary_content)
+                    conn.put(file_obj, args["path"])
+                    return True, f"文件写入成功：{args['path']} (实际写入 {len(binary_content)} 字节)"
+                except Exception as e:
+                    return False, f"写入失败：{str(e)}"
+            elif name == "run_remote_command":
+                conn = remote_manager.get_conn()
+                if not conn:
+                    return False, "未连接到远程主机"
+                try:
+                    timeout = int(args.get("timeout", 60))
+                    result = conn.run(args["command"], hide=True, timeout=timeout)
+                    output = result.stdout or result.stderr or "命令执行完成（无输出）"
+                    return True, f"Exit: {result.exited}\n{output}"
+                except Exception as e:
+                    return False, f"命令执行失败：{str(e)}"
+            elif name == "list_remote_dir":
+                conn = remote_manager.get_conn()
+                if not conn:
+                    return False, "未连接到远程主机"
+                try:
+                    path = args.get("path", ".")
+                    result = conn.run(f"ls -la '{path}'", hide=True, timeout=15)
+                    return True, result.stdout
+                except Exception as e:
+                    return False, f"列目录失败：{str(e)}"
+            elif name == "disconnect_remote":
+                return remote_manager.disconnect()
+            elif name == "remote_status":
+                return True, remote_manager.get_status()
 
         else:
             return False, f"❌ 未知工具: {name}"

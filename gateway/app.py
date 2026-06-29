@@ -602,15 +602,31 @@ async def responses(req: Request):
     
     messages = convert_responses_input(body.get("input", []), tools)
     
+    # Qwen3.5 开启思考模式的参数
+    extra_body = {
+        "enable_thinking": True,
+        "thinking_enabled": True,
+    }
+    # 传递用户请求中的 thinking 参数
+    if body.get("enable_thinking") is not None:
+        extra_body["enable_thinking"] = body.get("enable_thinking")
+    if body.get("thinking_enabled") is not None:
+        extra_body["thinking_enabled"] = body.get("thinking_enabled")
+
     payload = {
         "model": model,
         "messages": messages,
         "stream": stream,
         "temperature": body.get("temperature", 0.2),
-        "extra_body": {
-            "enable_thinking": True,
-        },
+        "extra_body": extra_body,
+        # 某些 vLLM 版本需要在顶层传递
+        "enable_thinking": True,
+        "thinking_enabled": True,
     }
+
+    # 调试：打印请求参数
+    print(f"[Gateway] 完整 payload extra_body: {extra_body}")
+    print(f"[Gateway] 顶层 enable_thinking: {payload.get('enable_thinking')}")
 
     # =====================================
     # STREAM
@@ -695,15 +711,27 @@ async def responses(req: Request):
                 if not choices:
                     continue  # Skip chunks with no choices
                 delta_obj = choices[0].get("delta", {})
-                piece = (
-                    delta_obj.get("content")
-                    or delta_obj.get("reasoning_content")
-                    or ""
-                )
-
+                
+                # 分离处理 content 和 reasoning_content
+                # reasoning_content 是思考过程，需要转发给 CLI
+                content_piece = delta_obj.get("content", "")
+                reasoning_piece = delta_obj.get("reasoning_content", "")
+                
+                # 都累积起来，思考过程用  标签包裹
+                piece = ""
+                
+                # 处理 reasoning_content：添加  标签
+                if reasoning_piece:
+                    piece += "" + reasoning_piece
+                
+                # 处理 content：如果之前有 reasoning，需要先关闭  标签
+                if content_piece:
+                    if reasoning_piece:
+                        piece += ""
+                    piece += content_piece
+                    
                 if piece:
                     accumulated += piece
-                # print("DELTA KEYS:", list(chunk.get("choices", [{}])[0].get("delta", {}).keys()))
 
                 emit_text = get_emit_text(accumulated)
                 new_text = emit_text[emitted_length:]

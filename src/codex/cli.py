@@ -875,6 +875,7 @@ class ChatAgent:
             "input": self.input_items,
             "stream": True,
             "temperature": CONFIG.temperature,
+            "enable_thinking": True,  # 显式开启思考模式
         }
 
         if self.agent_mode:
