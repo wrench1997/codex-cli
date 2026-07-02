@@ -1094,7 +1094,8 @@ class ToolExecutor:
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.workdir)
                 commits = []
-                for line in result.stdout.strip().split("\n"):
+                stdout = result.stdout.strip() if result.stdout else ""
+                for line in stdout.split("\n"):
                     if line:
                         parts = line.split("|", 4)
                         if len(parts) == 5:
@@ -1141,7 +1142,8 @@ class ToolExecutor:
                 output_parts.append("")
 
                 # 解析输出，分离 commit 信息和文件改动统计
-                raw_lines = result.stdout.split("\n")
+                # 使用 if-else 处理 stdout 为 None 的情况
+                raw_lines = result.stdout.split("\n") if result.stdout else []
 
                 # 提取 commit 信息（到第一个 diff --git 之前）
                 commit_info_lines = []

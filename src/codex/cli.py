@@ -1117,6 +1117,15 @@ class ChatAgent:
 
                 success, output = await self.executor.execute(name, args)
 
+                # 特殊处理 verify_task：如果验证通过，更新任务状态
+                if name == "verify_task" and success:
+                    # 检查输出中是否包含"所有验证通过"
+                    if "所有验证通过" in output or "✅ 所有验证通过" in output:
+                        self.task_state.mark_verified(True)
+                    elif "✅ 通过" in output and "⚠️" not in output:
+                        # 如果所有检查项都通过且没有警告，也标记为已验证
+                        self.task_state.mark_verified(True)
+
                 # 跟踪文件修改（用于任务状态）
                 write_tools = ["write_file", "search_replace", "insert_lines", "delete_lines", "replace_lines", "apply_patch"]
                 if name in write_tools and success and not output.startswith("__PENDING_WRITE__"):
