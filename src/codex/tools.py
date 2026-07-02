@@ -486,13 +486,26 @@ class ToolExecutor:
         except Exception as e:
             return False, f"❌ 错误: {e}\n{traceback.format_exc()}"
 
-    def _verify_task(self, acceptance_items: list[str]) -> tuple[bool, str]:
+    def _verify_task(self, acceptance_items: list[str] | str | None = None) -> tuple[bool, str]:
         """
         执行项目质量验证。
         自动分析项目类型，动态生成验证命令。
         返回验证结果。
         """
         import yaml
+
+        # 确保 acceptance_items 是列表，防止字符串被拆分成字符
+        if isinstance(acceptance_items, str):
+            # 尝试解析 JSON 格式的字符串
+            if acceptance_items.strip().startswith("["):
+                try:
+                    acceptance_items = json.loads(acceptance_items)
+                except json.JSONDecodeError:
+                    acceptance_items = [acceptance_items]
+            else:
+                acceptance_items = [acceptance_items]
+        elif not isinstance(acceptance_items, list):
+            acceptance_items = []
 
         quality_path = os.path.join(self.workdir, "agent", "quality.yaml")
         results = []
@@ -502,13 +515,6 @@ class ToolExecutor:
         def auto_detect_commands():
             """根据项目文件结构自动检测项目类型并生成验证命令"""
             commands = {}
-
-            # 始终包含 git diff 检查
-            commands["diff_check"] = {
-                "command": "git diff --check",
-                "required": True,
-                "description": "检查是否有 whitespace 错误或合并冲突标记"
-            }
 
             # 检测 Python 项目
             has_pyproject = os.path.exists(os.path.join(self.workdir, "pyproject.toml"))
@@ -672,7 +678,7 @@ class ToolExecutor:
         if acceptance_items:
             results.append("═══ 验收项核对 ═══")
             for i, item in enumerate(acceptance_items, 1):
-                results.append(f"  [ ] {item}")
+                results.append(f"  [{i}] {item}")
             results.append("")
             results.append("⚠️  请逐项确认以上验收项是否全部完成")
             results.append("")
@@ -686,7 +692,7 @@ class ToolExecutor:
 
         # 完成条件检查
         completion_config = completion_rules or {}
-        require_clean_diff = completion_config.get("require_clean_diff_check", True)
+        require_clean_diff = completion_config.get("require_clean_diff_check", False)  # Windows 下 CRLF 问题会导致误报
         require_all = completion_config.get("require_all_commands", False)
 
         results.append("═══ 完成条件检查 ═══")

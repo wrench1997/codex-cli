@@ -2,12 +2,6 @@
 # 用于 verify_task 工具自动执行验证命令
 
 commands:
-  # Git 差异检查（必须）
-  diff_check:
-    command: "git diff --check"
-    required: true
-    description: "检查是否有 whitespace 错误或合并冲突标记"
-
   # Python 语法检查
   lint:
     command: "python -m py_compile src/codex/cli.py src/codex/tools.py src/codex/file_editor.py src/codex/config.py src/codex/remote.py src/codex/mcp/manager.py src/codex/pack_for_ai.py"
@@ -35,6 +29,6 @@ rules:
 
 completion:
   require_all_commands: false   # 不强制所有命令都成功（有些项目可能没有测试）
-  require_clean_diff_check: true
+  require_clean_diff_check: false  # Windows 下 CRLF 问题会导致误报，不强制检查
   require_acceptance_checklist: true
   require_verification_before_done: true  # 关键：修改后必须验证才能说完成
