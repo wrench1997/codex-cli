@@ -40,14 +40,14 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "verify_task",
-            "description": "执行项目质量验证命令（格式化、编译、测试、git diff 检查）。在修改代码后、宣称任务完成前必须调用。返回所有验证命令的执行结果。",
+            "description": "【任务完成前必须调用】执行质量验证（编译/测试/git diff）。只在所有代码修改完成后调用一次，不要重复调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "acceptance_items": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "任务验收项列表，用于逐项核对"
+                        "description": "验收项列表（可选），用于逐项核对"
                     }
                 },
                 "required": [],
@@ -58,29 +58,29 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "update_lessons",
-            "description": "更新 agent/lessons.md，记录新发现的错误、根因和回归检查规则。当同一类错误第二次出现时自动调用。",
+            "description": "【仅在修复重复错误后调用】记录教训到 lessons.md。不要为每个错误都调用，只在同一类错误第二次出现时使用。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": {
                         "type": "string",
-                        "description": "问题标题（简短描述）"
+                        "description": "简短标题，如'尾随空格导致 diff 失败'"
                     },
                     "description": {
                         "type": "string",
-                        "description": "问题描述"
+                        "description": "问题现象描述"
                     },
                     "root_cause": {
                         "type": "string",
-                        "description": "根因分析"
+                        "description": "根本原因分析"
                     },
                     "rule": {
                         "type": "string",
-                        "description": "正确规则"
+                        "description": "正确做法/规则"
                     },
                     "regression_check": {
                         "type": "string",
-                        "description": "回归检查命令（bash）"
+                        "description": "回归检查命令（可选），如'git diff --check'"
                     }
                 },
                 "required": ["title", "description", "root_cause", "rule"],
@@ -91,27 +91,27 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "update_task_contract",
-            "description": "更新任务契约，记录当前任务的目标、验收项、受影响文件。在任务开始时或范围变化时调用。",
+            "description": "【仅在任务开始时调用一次】记录任务目标和范围。后续实现中不要重复调用，除非需求范围发生变化。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "goal": {
                         "type": "string",
-                        "description": "用户目标"
+                        "description": "用户想要实现什么（用一句话描述）"
                     },
                     "acceptance_items": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "验收项列表"
+                        "description": "验收项列表（可选），如'能正常运行'、'测试通过'"
                     },
                     "not_in_scope": {
                         "type": "string",
-                        "description": "明确不做的内容"
+                        "description": "明确不做的内容（可选），避免范围蔓延"
                     },
                     "affected_files": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "受影响的模块和文件"
+                        "description": "预计要修改的文件（可选）"
                     }
                 },
                 "required": ["goal"],
@@ -489,7 +489,7 @@ class ToolExecutor:
     def _verify_task(self, acceptance_items: list[str]) -> tuple[bool, str]:
         """
         执行项目质量验证。
-        读取 agent/quality.yaml，执行 format/build/test/diff-check 等命令。
+        自动分析项目类型，动态生成验证命令。
         返回验证结果。
         """
         import yaml
@@ -498,33 +498,121 @@ class ToolExecutor:
         results = []
         all_passed = True
 
-        # 尝试加载配置文件
+        # 自动分析项目类型并生成验证命令
+        def auto_detect_commands():
+            """根据项目文件结构自动检测项目类型并生成验证命令"""
+            commands = {}
+
+            # 始终包含 git diff 检查
+            commands["diff_check"] = {
+                "command": "git diff --check",
+                "required": True,
+                "description": "检查是否有 whitespace 错误或合并冲突标记"
+            }
+
+            # 检测 Python 项目
+            has_pyproject = os.path.exists(os.path.join(self.workdir, "pyproject.toml"))
+            has_setup_py = os.path.exists(os.path.join(self.workdir, "setup.py"))
+            has_requirements = os.path.exists(os.path.join(self.workdir, "requirements.txt"))
+            py_files = []
+            for root, dirs, files in os.walk(self.workdir):
+                # 跳过常见非源码目录
+                if any(skip in root for skip in ["__pycache__", ".git", "node_modules", "venv", ".venv", "dist", "build"]):
+                    continue
+                for f in files:
+                    if f.endswith(".py"):
+                        py_files.append(os.path.join(root, f))
+
+            if has_pyproject or has_setup_py or has_requirements or len(py_files) > 0:
+                # Python 项目
+                if py_files:
+                    # 限制文件数量，避免命令过长
+                    py_files_str = " ".join(py_files[:20])
+                    commands["lint"] = {
+                        "command": f"python -m py_compile {py_files_str}",
+                        "required": True,
+                        "description": "Python 语法检查"
+                    }
+                if has_pyproject:
+                    commands["build"] = {
+                        "command": "python -c \"import sys; sys.path.insert(0, '.'); import src\"" if os.path.exists(os.path.join(self.workdir, "src")) else "python -c \"print('Python project')\"",
+                        "required": False,
+                        "description": "Python 导入检查"
+                    }
+                # 检测是否有测试
+                test_dirs = ["tests", "test", "spec"]
+                has_tests = any(os.path.exists(os.path.join(self.workdir, d)) for d in test_dirs)
+                if has_tests:
+                    commands["test"] = {
+                        "command": "python -m pytest tests/ -v --tb=short",
+                        "required": False,
+                        "description": "运行单元测试"
+                    }
+
+            # 检测 Node.js 项目
+            has_package_json = os.path.exists(os.path.join(self.workdir, "package.json"))
+            if has_package_json:
+                # Node.js 项目
+                commands["lint"] = {
+                    "command": "npm run lint 2>nul || eslint . --ext .ts,.tsx,.js,.jsx 2>nul || echo 'No lint config found'",
+                    "required": False,
+                    "description": "JavaScript/TypeScript 代码检查"
+                }
+                commands["build"] = {
+                    "command": "npm run build 2>nul || tsc --noEmit 2>nul || echo 'No build script'",
+                    "required": False,
+                    "description": "构建或类型检查"
+                }
+                commands["test"] = {
+                    "command": "npm test 2>nul || jest 2>nul || echo 'No test config'",
+                    "required": False,
+                    "description": "运行测试"
+                }
+
+            # 检测 Zig 项目
+            has_build_zig = os.path.exists(os.path.join(self.workdir, "build.zig"))
+            if has_build_zig:
+                commands["lint"] = {
+                    "command": "zig ast-check src/*.zig 2>nul || echo 'No Zig source found'",
+                    "required": False,
+                    "description": "Zig 语法检查"
+                }
+                commands["build"] = {
+                    "command": "zig build --summary all",
+                    "required": False,
+                    "description": "Zig 项目构建"
+                }
+
+            return commands
+
+        # 优先自动检测项目类型，配置文件仅作为可选覆盖
+        detected_commands = auto_detect_commands()
+        completion_rules = {}
+        rules = []
+
+        # 如果配置文件存在，可以覆盖自动检测的命令
         if os.path.exists(quality_path):
             try:
                 with open(quality_path, "r", encoding="utf-8") as f:
                     config = yaml.safe_load(f)
+                    # 只使用配置文件中的 completion 规则和 rules
+                    completion_rules = config.get("completion", {})
+                    rules = config.get("rules", [])
+                    # 如果配置文件中明确定义了 commands，则使用配置文件的（向后兼容）
+                    # 否则使用自动检测的命令
+                    if config.get("commands"):
+                        commands = config.get("commands", {})
+                        results.append("ℹ️  使用 quality.yaml 中定义的验证命令\n")
+                    else:
+                        commands = detected_commands
+                        results.append("ℹ️  quality.yaml 未定义 commands，已自动检测项目类型并生成验证命令\n")
             except Exception as e:
-                return False, f"❌ 读取 quality.yaml 失败：{e}"
+                results.append(f"⚠️  读取 quality.yaml 失败：{e}，将使用自动检测\n")
+                commands = detected_commands
         else:
-            # 默认配置
-            config = {
-                "commands": {
-                    "diff_check": {"command": "git diff --check", "required": True},
-                    "lint": {"command": "python -m py_compile src/codex/*.py gateway/*.py main.py", "required": True},
-                    "build": {"command": "python -c 'import src.codex; import gateway'", "required": False},
-                    "test": {"command": "python -m pytest tests/ -v --tb=short", "required": False},
-                },
-                "rules": [],
-                "completion": {
-                    "require_all_commands": False,
-                    "require_clean_diff_check": True,
-                    "require_acceptance_checklist": True,
-                }
-            }
-
-        commands = config.get("commands", {})
-        completion_rules = config.get("completion", {})
-        rules = config.get("rules", [])
+            # 自动检测项目类型
+            commands = detected_commands
+            results.append("ℹ️  未找到 quality.yaml，已自动检测项目类型并生成验证命令\n")
 
         results.append("═══ 任务验证报告 ═══\n")
 

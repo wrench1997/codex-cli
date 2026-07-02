@@ -20,6 +20,15 @@ import glob
 import subprocess
 from datetime import datetime
 
+# 在 Windows 上设置标准输出为 UTF-8 编码，避免 emoji 字符编码错误
+# 使用 try-except 处理某些环境（如 StdoutProxy）不支持 reconfigure 的情况
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        # 如果 stdout 没有 reconfigure 方法（如 StdoutProxy），则忽略
+        pass
+
 
 def count_lines_in_file(file_path):
     """统计单个文件的非空行数"""
@@ -59,6 +68,7 @@ def get_git_repo_root():
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
+            encoding='utf-8',
             check=True
         )
         return result.stdout.strip()
@@ -73,6 +83,7 @@ def get_git_log(limit=20):
             ["git", "log", f"-{limit}", "--pretty=format:%H|%an|%ae|%ai|%s", "--no-merges"],
             capture_output=True,
             text=True,
+            encoding='utf-8',
             check=True
         )
         commits = []
@@ -100,6 +111,7 @@ def get_git_diff_stats(commit_hash):
             ["git", "show", "--stat", "--no-patch", commit_hash],
             capture_output=True,
             text=True,
+            encoding='utf-8',
             check=True
         )
         return result.stdout.strip()
@@ -111,10 +123,12 @@ def get_git_diff_content(commit_hash, max_lines=1000, cwd=None):
     """获取某个提交的详细改动内容（限制行数）"""
     try:
         # 使用 -p 或 --patch 来显示 diff，不使用 --no-stat（不是标准参数）
+        # 显式指定 encoding='utf-8' 避免 Windows 上 GBK 编码问题
         result = subprocess.run(
             ["git", "show", "-p", commit_hash],
             capture_output=True,
             text=True,
+            encoding='utf-8',
             check=True,
             cwd=cwd
         )
@@ -123,7 +137,7 @@ def get_git_diff_content(commit_hash, max_lines=1000, cwd=None):
             lines = lines[:max_lines]
             lines.append(f"\n... (内容被截断，共超过 {max_lines} 行)")
         return "\n".join(lines)
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         print(f"  ⚠️  获取 diff 失败：{e}")
         return ""
 
@@ -135,6 +149,7 @@ def get_git_status():
             ["git", "status", "--short"],
             capture_output=True,
             text=True,
+            encoding='utf-8',
             check=True
         )
         return result.stdout.strip()
@@ -149,6 +164,7 @@ def get_current_branch():
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
+            encoding='utf-8',
             check=True
         )
         return result.stdout.strip()
@@ -223,6 +239,7 @@ def pack_for_ai(config_path, output_file=None, include_git=True, git_limit=1, cw
                         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                         capture_output=True,
                         text=True,
+                        encoding='utf-8',
                         check=True,
                         cwd=cwd
                     )
@@ -237,6 +254,7 @@ def pack_for_ai(config_path, output_file=None, include_git=True, git_limit=1, cw
                         ["git", "status", "--short"],
                         capture_output=True,
                         text=True,
+                        encoding='utf-8',
                         check=True,
                         cwd=cwd
                     )
@@ -253,6 +271,7 @@ def pack_for_ai(config_path, output_file=None, include_git=True, git_limit=1, cw
                         ["git", "log", f"-{git_limit}", "--pretty=format:%H|%an|%ae|%ai|%s", "--no-merges"],
                         capture_output=True,
                         text=True,
+                        encoding='utf-8',
                         check=True,
                         cwd=cwd
                     )

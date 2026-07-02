@@ -1,0 +1,11 @@
+{
+  "goal": "修复 pack_for_ai 工具在 Windows 上因编码问题导致的崩溃错误",
+  "acceptance": "[\"pack_for_ai 能成功执行，不出现 UnicodeDecodeError\", \"pack_for_ai 能成功执行，不出现 AttributeError: 'NoneType' object has no attribute 'split'\", \"生成的输出文件包含正确的 Git 历史信息\", \"代码在 Windows 终端能正常显示（无编码错误）\"]",
+  "affected_files": "[\"D:\\\\workspace\\\\codex-cli\\\\src\\\\codex\\\\pack_for_ai.py\"]",
+  "status": "implementing",
+  "changed_files": [],
+  "verification": {
+    "required": [],
+    "passed": []
+  }
+}
