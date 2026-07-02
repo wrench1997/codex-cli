@@ -495,17 +495,24 @@ class ToolExecutor:
         import yaml
 
         # 确保 acceptance_items 是列表，防止字符串被拆分成字符
-        if isinstance(acceptance_items, str):
+        if acceptance_items is None:
+            acceptance_items = []
+        elif isinstance(acceptance_items, str):
             # 尝试解析 JSON 格式的字符串
             if acceptance_items.strip().startswith("["):
                 try:
                     acceptance_items = json.loads(acceptance_items)
+                    if not isinstance(acceptance_items, list):
+                        acceptance_items = [acceptance_items]
                 except json.JSONDecodeError:
                     acceptance_items = [acceptance_items]
             else:
                 acceptance_items = [acceptance_items]
-        elif not isinstance(acceptance_items, list):
-            acceptance_items = []
+        elif isinstance(acceptance_items, (dict, int, float, bool)):
+            # 其他非列表类型，转为单元素列表
+            acceptance_items = [acceptance_items]
+        elif not hasattr(acceptance_items, '__iter__'):
+            acceptance_items = [acceptance_items]
 
         quality_path = os.path.join(self.workdir, "agent", "quality.yaml")
         results = []
@@ -835,7 +842,21 @@ class ToolExecutor:
     def _dispatch(self, name: str, args: dict) -> tuple[bool, str]:
         # ── verify_task ─────────────────────────────────
         if name == "verify_task":
-            return self._verify_task(args.get("acceptance_items", []))
+            acceptance_items = args.get("acceptance_items", [])
+            # 确保是列表，防止字符串被拆分成字符（AI 可能把列表格式化成 JSON 字符串）
+            if isinstance(acceptance_items, str):
+                if acceptance_items.strip().startswith("["):
+                    try:
+                        acceptance_items = json.loads(acceptance_items)
+                        if not isinstance(acceptance_items, list):
+                            acceptance_items = [acceptance_items]
+                    except json.JSONDecodeError:
+                        acceptance_items = [acceptance_items]
+                else:
+                    acceptance_items = [acceptance_items]
+            elif not isinstance(acceptance_items, list):
+                acceptance_items = [acceptance_items]
+            return self._verify_task(acceptance_items)
 
         # ── update_lessons ─────────────────────────────────
         if name == "update_lessons":
