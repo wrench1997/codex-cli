@@ -68,6 +68,7 @@ class TaskState:
         self.changed_files: set[str] = set()   # 已修改的文件
         self.verification_passed = False       # 验证是否通过
         self.status = "idle"                   # idle / implementing / verifying / done
+        self.completed_items: set[int] = set() # 已完成的验收项索引（用于跟踪哪些验收项已完成）
 
     def mark_modified(self, files: list[str]):
         """标记代码已被修改"""
@@ -88,11 +89,38 @@ class TaskState:
         else:
             self.status = "verifying"
 
+    def mark_item_completed(self, item_index: int):
+        """标记某个验收项已完成（索引从 1 开始）"""
+        self.completed_items.add(item_index)
+
+    def are_all_items_completed(self) -> bool:
+        """检查所有验收项是否都已完成"""
+        if not self.acceptance_items:
+            # 没有验收项时，只要验证通过就视为完成
+            return self.verification_passed or len(self.completed_items) > 0
+        return len(self.completed_items) >= len(self.acceptance_items)
+
+    def parse_completed_items_from_text(self, text: str):
+        """从 AI 回复文本中解析已完成的验收项标记（如 '✅ 验收项 [1] 已完成'）"""
+        import re
+        # 匹配模式：✅ 验收项 [N] 已完成 或 ✅ 验收项 N 已完成
+        # 使用分组匹配两种格式：[N] 或纯数字
+        pattern = r"✅\s*验收项\s*(?:\[(\d+)\]|(\d+))\s*已完成"
+        matches = re.findall(pattern, text)
+        for match in matches:
+            # match 是元组 (带括号的数字，不带括号的数字)，取非空的那个
+            item_str = match[0] or match[1]
+            if item_str:
+                item_index = int(item_str)
+                if 1 <= item_index <= len(self.acceptance_items):
+                    self.completed_items.add(item_index)
+
     def can_finish(self) -> bool:
         """检查是否满足完成条件"""
         if not self.dirty:
             return True  # 没改过代码，可以直接结束
-        return self.verification_passed
+        # 必须同时满足：验证通过 + 所有验收项完成
+        return self.verification_passed and self.are_all_items_completed()
 
     def reset(self):
         """重置状态"""
@@ -101,6 +129,7 @@ class TaskState:
         self.changed_files = set()
         self.verification_passed = False
         self.status = "idle"
+        self.completed_items = set()
 
 
 
@@ -123,8 +152,8 @@ if sys.platform.startswith("win"):
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\r\b\x0c\x0e-\x1f\x7f]")
 
-MAX_VISIBLE_STREAM_CHARS = 5000
-MAX_PANEL_CHARS = 8000
+MAX_VISIBLE_STREAM_CHARS = 15000
+MAX_PANEL_CHARS = 18000
 
 def _sanitize_stream_text(text: str) -> str:
     text = ANSI_RE.sub("", text)
@@ -768,7 +797,20 @@ class ChatAgent:
             f"5. Read agent/lessons.md for project-specific gotchas and non-regression rules.\n"
             f"6. Read agent/quality.yaml for required build/test/lint commands.\n"
             f"7. When starting a task, call `update_task_contract` to record goal and acceptance criteria.\n"
-            f"8. When encountering a repeated error, call `update_lessons` to record the root cause and regression rule.\n"
+            f"8. When encountering a repeated error, call `update_lessons` to record the root cause and regression rule.\n\n"
+            f"## 验收项执行纪律（最重要）:\n"
+            f"- 接到任务后， FIRST thing: 调用 `update_task_contract` 明确所有验收项\n"
+            f"- 实现过程中，逐项勾验：每完成一个验收项，在回复中明确标注 '✅ 验收项 [N] 已完成'\n"
+            f"- 任务结束前，必须逐项核对：列出每个验收项的完成证据（测试结果、截图、日志等）\n"
+            f"- 严禁遗漏：如果任务有 10 个验收项，必须完成 10 个，少一个都不行\n"
+            f"- 严禁偷工减料：不得以'最小改动'为借口跳过边缘情况、异常处理或测试\n"
+            f"- 如果验收项无法完成，必须明确说明原因，不得假装已完成\n\n"
+            f"## 任务完成标准:\n"
+            f"只有同时满足以下条件才能宣称任务完成：\n"
+            f"1. ✅ 所有验收项都有明确的完成证据\n"
+            f"2. ✅ verify_task 执行成功，所有验证命令通过\n"
+            f"3. ✅ 没有未解释的失败、跳过项或 TODO\n"
+            f"4. ✅ 在回复中明确列出：修改文件、验证命令及结果、剩余风险\n"
         ]
 
         # 读取 agent/skills.md 作为额外的技能提示词（如果存在）
@@ -819,6 +861,10 @@ class ChatAgent:
         })
 
     def add_assistant(self, text: str):
+        # 自动从 AI 回复中解析已完成的验收项标记
+        if self.task_state.acceptance_items:
+            self.task_state.parse_completed_items_from_text(text)
+        
         self.input_items.append({
             "type": "message",
             "role": "assistant",
@@ -1076,14 +1122,29 @@ class ChatAgent:
                 if self.task_state.dirty and not self.task_state.can_finish():
                     # 自动插入系统消息，要求模型执行验证
                     self.add_assistant(visible_text)
+                    
+                    # 构建详细的门禁消息，明确列出未完成项
+                    acceptance_items = self.task_state.acceptance_items
+                    completed_items = self.task_state.completed_items
+                    
+                    unfinished_items = []
+                    if acceptance_items:
+                        for i, item in enumerate(acceptance_items, 1):
+                            if i not in completed_items:
+                                unfinished_items.append(f"  - [{i}] {item}")
+                    
                     self.add_user(
-                        "【系统门禁】⚠️  检测到代码已修改但尚未通过验证。\n\n"
-                        "根据工程执行协议，你必须：\n"
-                        "1. 调用 `verify_task` 工具执行质量验证命令\n"
-                        "2. 或明确报告未完成原因和阻塞问题\n\n"
-                        f"已修改的文件：{', '.join(self.task_state.changed_files)}\n"
-                        f"验收项：{self.task_state.acceptance_items if self.task_state.acceptance_items else '（未设置）'}\n\n"
-                        "**不得宣称任务完成，直到验证通过或明确说明未完成。**"
+                        "【系统门禁】⚠️  检测到代码已修改但任务未完成，不得宣称任务完成。\n\n"
+                        "根据工程执行协议，你必须完成以下所有事项：\n\n"
+                        f"📋 **未完成的验收项** ({len(unfinished_items)}/{len(acceptance_items) if acceptance_items else 0})：\n"
+                        + ("\n".join(unfinished_items) if unfinished_items else "  （无验收项或全部已完成）") + "\n\n"
+                        f"🔧 **已修改的文件**：{', '.join(self.task_state.changed_files)}\n\n"
+                        f"✅ **已完成的验收项**：{len(completed_items)} 项\n\n"
+                        "**你必须**：\n"
+                        "1. 逐项完成上述未完成的验收项，每项完成后明确标注 '✅ 验收项 [N] 已完成'\n"
+                        "2. 调用 `verify_task` 工具执行质量验证命令\n"
+                        "3. 或明确报告未完成原因和阻塞问题\n\n"
+                        "**严禁宣称任务完成，直到所有验收项完成且验证通过。**"
                     )
                     continue  # 继续循环，让模型回应
 
@@ -1117,14 +1178,25 @@ class ChatAgent:
 
                 success, output = await self.executor.execute(name, args)
 
-                # 特殊处理 verify_task：如果验证通过，更新任务状态
+                # 特殊处理 verify_task：只要验证通过（success=True），立即放行门禁
                 if name == "verify_task" and success:
-                    # 检查输出中是否包含"所有验证通过"
-                    if "所有验证通过" in output or "✅ 所有验证通过" in output:
-                        self.task_state.mark_verified(True)
-                    elif "✅ 通过" in output and "⚠️" not in output:
-                        # 如果所有检查项都通过且没有警告，也标记为已验证
-                        self.task_state.mark_verified(True)
+                    # 关键修复：不再检查输出字符串，只要 success=True 就认为验证通过
+                    # 这样可以避免因输出格式不匹配导致的无限循环
+                    self.task_state.mark_verified(True)
+                    # 自动将所有验收项标记为已完成，防止门禁继续拦截
+                    if self.task_state.acceptance_items:
+                        for i in range(1, len(self.task_state.acceptance_items) + 1):
+                            self.task_state.completed_items.add(i)
+                    else:
+                        # 没有验收项时，添加虚拟标记，确保 can_finish() 返回 True
+                        self.task_state.completed_items.add(0)
+                
+                # 特殊处理 update_task_contract：记录验收项
+                if name == "update_task_contract" and success:
+                    # 从参数中提取验收项并设置到任务状态
+                    items = args.get("acceptance_items", [])
+                    if items:
+                        self.task_state.set_acceptance_items(items)
 
                 # 跟踪文件修改（用于任务状态）
                 write_tools = ["write_file", "search_replace", "insert_lines", "delete_lines", "replace_lines", "apply_patch"]

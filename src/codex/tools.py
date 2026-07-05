@@ -277,7 +277,7 @@ TOOLS: list[dict] = [
                 "properties": {
                     "command": {"type": "string", "description": "要执行的 shell 命令"},
                     "workdir": {"type": "string", "description": "工作目录，默认当前目录"},
-                    "timeout": {"type": "integer", "description": "超时秒数，默认 60", "default": 60},
+                    "timeout": {"type": "integer", "description": "超时秒数，默认 1800", "default": 1800},
                 },
                 "required": ["command"],
             },
@@ -684,10 +684,14 @@ class ToolExecutor:
         # 验收项核对
         if acceptance_items:
             results.append("═══ 验收项核对 ═══")
+            results.append("请逐项确认以下验收项的完成情况：\n")
             for i, item in enumerate(acceptance_items, 1):
                 results.append(f"  [{i}] {item}")
             results.append("")
-            results.append("⚠️  请逐项确认以上验收项是否全部完成")
+            results.append("⚠️  你必须：\n")
+            results.append("  1. 对每个验收项提供完成证据（测试结果、截图、日志等）\n")
+            results.append("  2. 在回复中明确标注 '✅ 验收项 [N] 已完成'\n")
+            results.append("  3. 如果有未完成项，说明原因和后续计划\n")
             results.append("")
 
         # 规则提醒
@@ -1048,7 +1052,7 @@ class ToolExecutor:
                 workdir = self._resolve(args["workdir"])
             else:
                 workdir = self.workdir
-            timeout = int(args.get("timeout", 60))
+            timeout = int(args.get("timeout", 1800))
             cmd = args["command"]
 
             # Windows 下需要创建新的进程组，以便超时时可以终止整个进程树
@@ -1061,6 +1065,7 @@ class ToolExecutor:
                 proc = subprocess.Popen(
                     cmd,
                     shell=True,
+                    stdin=subprocess.DEVNULL,  # 断开控制台输入，防止用户按键（如 ESC）干扰子进程
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -1364,7 +1369,7 @@ class ToolExecutor:
                 if not conn:
                     return False, "未连接到远程主机"
                 try:
-                    timeout = int(args.get("timeout", 60))
+                    timeout = int(args.get("timeout", 1800))
                     result = conn.run(args["command"], hide=True, timeout=timeout)
                     output = result.stdout or result.stderr or "命令执行完成（无输出）"
                     return True, f"Exit: {result.exited}\n{output}"
