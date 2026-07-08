@@ -235,7 +235,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "search_in_files",
-            "description": "在目录中全文搜索关键词，返回匹配的行。支持正则、大小写控制、上下文显示和文件排除。",
+            "description": "在目录中全文搜索关键词，返回匹配的行。支持正则、大小写控制、上下文显示和文件排除。（已优化：默认排除二进制文件和编译目录，单行超过 500 字符自动截断）",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -243,10 +243,11 @@ TOOLS: list[dict] = [
                     "directory": {"type": "string", "description": "搜索目录", "default": "."},
                     "file_glob": {"type": "string", "description": "文件 glob 模式，默认 **/*", "default": "**/*"},
                     "regex": {"type": ["boolean", "string"], "description": "是否使用正则表达式。默认 'auto' 会自动检测 pattern 中的正则特殊字符", "default": "auto", "enum": [True, False, "auto"]},
-                    "max_results": {"type": "integer", "description": "最大结果数", "default": 50},
+                    "max_results": {"type": "integer", "description": "最大结果数，默认 50（防止 token 爆炸）", "default": 50},
                     "case_sensitive": {"type": "boolean", "description": "是否区分大小写", "default": True},
                     "context_lines": {"type": "integer", "description": "上下文行数（前后各显示多少行）", "default": 0},
                     "exclude_glob": {"type": "string", "description": "排除的文件 glob 模式，逗号分隔（如 *.log, **/test/**）", "default": ""},
+                    "max_line_length": {"type": "integer", "description": "单行最大长度，超过则截断，默认 500", "default": 500},
                 },
                 "required": ["pattern"],
             },
@@ -993,6 +994,9 @@ class ToolExecutor:
             max_results = args.get("max_results", 50)
             if isinstance(max_results, str):
                 max_results = int(max_results)
+            max_line_length = args.get("max_line_length", 500)
+            if isinstance(max_line_length, str):
+                max_line_length = int(max_line_length)
             hits = search_in_files(
                 args["pattern"],
                 directory=self._resolve(args.get("directory", ".")),
@@ -1002,6 +1006,7 @@ class ToolExecutor:
                 case_sensitive=args.get("case_sensitive", True),
                 context_lines=args.get("context_lines", 0),
                 exclude_glob=args.get("exclude_glob", ""),
+                max_line_length=max_line_length,
             )
             if not hits:
                 return True, "🔍 未找到匹配结果。"

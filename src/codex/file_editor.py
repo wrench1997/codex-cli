@@ -222,10 +222,11 @@ def search_in_files(
     directory: str = ".",
     file_glob: str = "**/*",
     regex: bool = False,
-    max_results: int = 200,
+    max_results: int = 50,
     case_sensitive: bool = True,
     context_lines: int = 0,
     exclude_glob: str = "",
+    max_line_length: int = 500,
 ) -> list[dict]:
     """
     在目录中搜索文本，返回匹配列表。
@@ -235,10 +236,11 @@ def search_in_files(
         directory: 搜索目录
         file_glob: 文件 glob 模式，默认 **/*
         regex: 是否使用正则表达式。如果为 "auto" 或未指定，当检测到 pattern 包含正则特殊字符时自动启用
-        max_results: 最大结果数
+        max_results: 最大结果数，默认 50（防止 token 爆炸）
         case_sensitive: 是否区分大小写（默认区分）
         context_lines: 上下文行数（前后各显示多少行）
         exclude_glob: 排除的文件 glob 模式（如 *.log, **/test/**）
+        max_line_length: 单行最大长度，超过则截断，防止超长行消耗 token，默认 500
     
     Returns:
         每项：{file, line_no, line, context_before, context_after, rel_path}
@@ -246,7 +248,8 @@ def search_in_files(
     """
     # 确保参数类型正确（兼容 MCP 调用时可能传入字符串的情况）
     context_lines = int(context_lines) if context_lines else 0
-    max_results = int(max_results) if max_results else 200
+    max_results = int(max_results) if max_results else 50
+    max_line_length = int(max_line_length) if max_line_length else 500
     results = []
     base_path = Path(directory).resolve()
     patterns = _load_gitignore_patterns(base_path)
@@ -271,27 +274,45 @@ def search_in_files(
     # 解析排除模式
     exclude_patterns = exclude_glob.split(",") if exclude_glob else []
     
+    # 始终忽略的目录（扩展版，排除编译产物和打包目录）
+    ALWAYS_IGNORE_DIRS = {
+        '.git', 'node_modules', '.zig-cache', '__pycache__', '.venv', '.vscode', 
+        'zig-out', '.next', 'out', 'dist', 'build', '.pytest_cache', 'venv',
+        'target', 'bin', 'obj', '.idea', '.vs', 'coverage', '.nyc_output'
+    }
+    
+    # 二进制文件扩展名（避免搜索二进制文件）
+    BINARY_EXTENSIONS = {'.pyc', '.pyo', '.so', '.dll', '.exe', '.bin', '.dat', 
+                         '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp',
+                         '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.tar',
+                         '.gz', '.rar', '.7z', '.wav', '.mp3', '.mp4', '.avi', '.mov',
+                         '.wasm', '.bundle', '.map'}
+    
     files_searched = 0
     files_matched = 0
-    
-    # 始终忽略的目录（与 list_directory 保持一致）
-    ALWAYS_IGNORE_DIRS = {'.git', 'node_modules', '.zig-cache', '__pycache__', '.venv', '.vscode', 'zig-out', '.next'}
     
     for p in Path(directory).glob(file_glob):
         if not p.is_file():
             continue
         
+        # 确保使用绝对路径进行相对路径计算
+        p_abs = p.resolve()
+        
         # 检查是否在始终忽略的目录中
         should_skip = False
-        for part in p.relative_to(base_path).parts:
+        for part in p_abs.relative_to(base_path).parts:
             if part in ALWAYS_IGNORE_DIRS:
                 should_skip = True
                 break
         if should_skip:
             continue
         
+        # 检查二进制文件扩展名
+        if p_abs.suffix.lower() in BINARY_EXTENSIONS:
+            continue
+        
         # 检查排除模式
-        rel_str = str(p.relative_to(base_path)).replace("\\", "/")
+        rel_str = str(p_abs.relative_to(base_path)).replace("\\", "/")
         excluded = False
         for exc in exclude_patterns:
             exc = exc.strip()
@@ -302,11 +323,11 @@ def search_in_files(
             continue
         
         # 检查是否应该被 .gitignore 忽略
-        if _should_ignore(p, base_path, patterns):
+        if _should_ignore(p_abs, base_path, patterns):
             continue
         
         try:
-            content = p.read_text(encoding="utf-8", errors="replace")
+            content = p_abs.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
         
@@ -322,17 +343,23 @@ def search_in_files(
             )
             if matched:
                 file_matched = True
-                # 获取上下文
-                ctx_before = lines[max(0, i-1-context_lines):i-1]
-                ctx_after = lines[i:min(len(lines), i+context_lines)]
+                # 截断超长行，防止 token 爆炸
+                truncated_line = line[:max_line_length] + f"... (截断，共 {len(line)} 字符)" if len(line) > max_line_length else line
+                
+                # 获取上下文（同样截断）
+                ctx_before = [l[:max_line_length] + "..." if len(l) > max_line_length else l 
+                             for l in lines[max(0, i-1-context_lines):i-1]]
+                ctx_after = [l[:max_line_length] + "..." if len(l) > max_line_length else l
+                            for l in lines[i:min(len(lines), i+context_lines)]]
                 
                 results.append({
-                    "file": str(p),
+                    "file": str(p_abs),
                     "rel_path": rel_str,
                     "line_no": i,
-                    "line": line,
+                    "line": truncated_line,
                     "context_before": ctx_before,
                     "context_after": ctx_after,
+                    "original_line_length": len(line),  # 记录原始长度
                 })
                 if len(results) >= max_results:
                     break

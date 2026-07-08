@@ -13,6 +13,17 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+# 导入上下文压缩模块
+try:
+    from .context_compressor import compress_on_context_limit, ContextCompressor
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from context_compressor import compress_on_context_limit, ContextCompressor
+
+
+class ContextLimitExceededError(Exception):
+    """上下文超限异常"""
+    pass
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -314,6 +325,17 @@ TOOL_CALL_RE = re.compile(
     re.S,
 )
 PARAM_RE = re.compile(r"<parameter=(?P<name>[^>]+)>\s*(?P<value>.*?)</parameter>", re.S)
+# vLLM 上下文超限错误检测正则（实验性）
+# 用于捕获上下文超限、OOM、KV cache 不足等错误
+CONTEXT_LIMIT_RE = re.compile(
+    r"context.*(length|limit|size|window).*(exceed|over|too long)|"
+    r"input.*(tokens).*exceed|"
+    r"length.*exceed.*maximum|"
+    r"input.*too long|"
+    r"out of.*(memory|kv cache)|"
+    r"(400|500).*(Bad Request|Internal Server Error)",
+    re.IGNORECASE
+)
 
 # =========================================================
 # MEMORY
@@ -539,6 +561,7 @@ async def vllm_stream(payload):
     start_time = time.perf_counter()
     ttft_measured = None
     first_token_received = False
+    context_limit_detected = False  # 上下文超限标志
     
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload_with_usage) as r:
@@ -550,6 +573,22 @@ async def vllm_stream(payload):
                     return
                 try:
                     chunk = json.loads(data)
+                    
+                    # 检测错误响应（包括上下文超限）
+                    if "__error__" in chunk or "error" in chunk:
+                        error_msg = chunk.get("__error__", chunk.get("error", ""))
+                        error_str = str(error_msg)
+                        
+                        # 使用正则检测是否为上下文超限错误
+                        if CONTEXT_LIMIT_RE.search(error_str):
+                            context_limit_detected = True
+                            print(f"[Gateway] ⚠️  检测到上下文超限错误：{error_str[:200]}")
+                            # 抛出异常，供上层重试逻辑处理
+                            raise ContextLimitExceededError(f"Context limit exceeded: {error_str}")
+                        else:
+                            print(f"[Gateway] ❌ 检测到其他错误：{error_str[:200]}")
+                            # 其他错误也抛出异常
+                            raise Exception(f"vLLM error: {error_str}")
                     
                     # 测量 TTFT：检测到第一个有内容的 delta 时记录时间
                     if not first_token_received:
@@ -574,8 +613,17 @@ async def vllm_stream(payload):
                         if input_tokens > 0 or output_tokens > 0:
                             billing_stats.add_request(input_tokens, output_tokens, ttft)
                     yield chunk
-                except:
-                    continue
+                except Exception as e:
+                    # 捕获异常并检测是否为上下文超限
+                    error_str = str(e)
+                    if CONTEXT_LIMIT_RE.search(error_str):
+                        context_limit_detected = True
+                        print(f"[Gateway] ⚠️  检测到上下文超限异常：{error_str[:200]}")
+                        # 抛出异常，供上层重试逻辑处理
+                        raise ContextLimitExceededError(f"Context limit exceeded: {error_str}")
+                    else:
+                        print(f"[Gateway] ❌ 请求异常：{e}")
+                        raise
 
 # =========================================================
 # MODELS
@@ -627,131 +675,178 @@ async def responses(req: Request):
     # 调试：打印请求参数
     print(f"[Gateway] 完整 payload extra_body: {extra_body}")
     print(f"[Gateway] 顶层 enable_thinking: {payload.get('enable_thinking')}")
+    
+    # 上下文压缩重试逻辑
+    compressor = ContextCompressor()
+    max_retries = 2  # 最多重试 2 次压缩
+    last_error = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            # 尝试请求
+            if stream:
+                return await _handle_stream_response(payload, response_id, model)
+            else:
+                # 非流式请求直接返回
+                return await _handle_non_stream_response(payload, response_id, model)
+        except ContextLimitExceededError as e:
+            last_error = e
+            # 检测是否为上下文超限错误
+            if attempt < max_retries:
+                print(f"[Gateway] ⚠️  检测到上下文超限，尝试自动压缩（第 {attempt + 1} 次重试）")
+                # 压缩上下文
+                compressed_messages = compress_on_context_limit(
+                    messages, 
+                    compressor=compressor, 
+                    max_tokens=262144
+                )
+                payload["messages"] = compressed_messages
+                # 更新 compressor 配置，下一轮更激进的压缩
+                compressor.max_history_rounds = max(3, compressor.max_history_rounds - 5)
+            else:
+                # 已达到最大重试次数，返回错误响应
+                print(f"[Gateway] ❌ 上下文压缩失败，已达到最大重试次数")
+                return JSONResponse({
+                    "error": {
+                        "type": "context_limit_exceeded",
+                        "message": str(e),
+                        "suggestion": "请减少对话历史长度或清空对话"
+                    }
+                }, status_code=400)
+        except Exception as e:
+            # 其他错误直接抛出
+            raise
+    
+    # 不应该到达这里，但为了类型检查保留
+    return JSONResponse({"error": "Unexpected error"})
 
-    # =====================================
-    # STREAM
-    # =====================================
-    if stream:
-        async def stream_events():
-            item_id = f"msg_{uuid.uuid4().hex[:8]}"
+
+async def _handle_stream_response(payload: dict, response_id: str, model: str):
+    """处理流式响应"""
+    item_id = f"msg_{uuid.uuid4().hex[:8]}"
+    
+    async def stream_events():
+        nonlocal item_id
+        # 帮助函数，强行使用 ensure_ascii=False 防止乱码
+        def make_event(event_type, event_payload):
+            payload_dict = {"type": event_type, **event_payload}
+            return f"data: {json.dumps(payload_dict, ensure_ascii=False)}\n\n"
+
+        yield make_event("response.created", {"response": {"id": response_id, "object": "response", "created_at": int(time.time()), "status": "in_progress", "model": model, "output": []}})
+        yield make_event("response.in_progress", {"response": {"id": response_id, "object": "response", "status": "in_progress", "model": model}})
+
+        accumulated = ""
+        emitted_length = 0
+        full_text = ""
+        message_item_created = False
+        content_part_created = False
+
+        async for chunk in vllm_stream(payload):
+            # ------------------------------------
+            # 遇到 [DONE] 时统一结算：支持 纯文本 / 纯工具 / 文本 + 工具混合
+            # ------------------------------------
+            if chunk == "[DONE]":
+                tc = parse_xml_tool_call(accumulated)
+                
+                output_items = []
+                output_index = 0
+                
+                # 1. 结算阶段：如果有被打开的普通文本对话，安全关闭并提交
+                if message_item_created:
+                    if content_part_created:
+                        yield make_event("response.output_text.done", {"item_id": item_id, "output_index": output_index, "content_index": 0, "text": full_text})
+                        yield make_event("response.content_part.done", {"item_id": item_id, "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": full_text}})
+                    
+                    text_item = {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": full_text}]}
+                    yield make_event("response.output_item.done", {"output_index": output_index, "item": text_item})
+                    
+                    output_items.append(text_item)
+                    output_index += 1  # 关键修复：工具推移到下一个 Index，避免状态冲突
+
+                # 2. 结算阶段：如果解析出了工具调用，发送工具请求事件
+                if tc:
+                    tool_item_id = f"fc_{uuid.uuid4().hex[:8]}"
+                    tool_args = tc["function"]["arguments"]
+                    tool_name = tc["function"]["name"]
+                    
+                    yield make_event("response.output_item.added", {"output_index": output_index, "item": {"id": tool_item_id, "type": "function_call", "status": "in_progress", "call_id": tc['id'], "name": tool_name, "arguments": ""}})
+                    yield make_event("response.function_call_arguments.delta", {"item_id": tool_item_id, "output_index": output_index, "delta": tool_args})
+                    yield make_event("response.function_call_arguments.done", {"item_id": tool_item_id, "output_index": output_index, "arguments": tool_args})
+                    
+                    func_item = {"id": tool_item_id, "type": "function_call", "status": "completed", "call_id": tc['id'], "name": tool_name, "arguments": tool_args}
+                    yield make_event("response.output_item.done", {"output_index": output_index, "item": func_item})
+                    
+                    output_items.append(func_item)
+
+                # 3. 结算阶段：如果异常情况下没有任何输出，兜底发一个空回复以防止 CLI 报错
+                if not output_items:
+                    text_item = {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": ""}]}
+                    yield make_event("response.output_item.added", {"output_index": output_index, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}})
+                    yield make_event("response.output_item.done", {"output_index": output_index, "item": text_item})
+                    output_items.append(text_item)
+
+                final_resp = {"id": response_id, "object": "response", "created_at": int(time.time()), "status": "completed", "model": model, "output": output_items}
+                RESPONSES[response_id] = final_resp
+                yield make_event("response.completed", {"response": final_resp})
+                yield "data: [DONE]\n\n"
+                return
+
+            # ------------------------------------
+            # 正常文本流处理（过滤 XML 及思考过程）
+            # ------------------------------------
+            if "__error__" in chunk:
+                # 如果是上下文超限错误，抛出异常让重试逻辑处理
+                if chunk.get("context_limit_exceeded"):
+                    raise ContextLimitExceededError(chunk.get('__error__'))
+                yield make_event("response.failed", {"error": chunk.get('__error__')})
+                yield "data: [DONE]\n\n"
+                return
+
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue  # Skip chunks with no choices
+            delta_obj = choices[0].get("delta", {})
             
-            # 帮助函数，强行使用 ensure_ascii=False 防止乱码
-            def make_event(event_type, event_payload):
-                payload_dict = {"type": event_type, **event_payload}
-                return f"data: {json.dumps(payload_dict, ensure_ascii=False)}\n\n"
-
-            yield make_event("response.created", {"response": {"id": response_id, "object": "response", "created_at": int(time.time()), "status": "in_progress", "model": model, "output": []}})
-            yield make_event("response.in_progress", {"response": {"id": response_id, "object": "response", "status": "in_progress", "model": model}})
-
-            accumulated = ""
-            emitted_length = 0
-            full_text = ""
-            message_item_created = False
-            content_part_created = False
-
-            async for chunk in vllm_stream(payload):
-                # ------------------------------------
-                # 遇到 [DONE] 时统一结算：支持 纯文本 / 纯工具 / 文本+工具混合
-                # ------------------------------------
-                if chunk == "[DONE]":
-                    tc = parse_xml_tool_call(accumulated)
-                    
-                    output_items = []
-                    output_index = 0
-                    
-                    # 1. 结算阶段：如果有被打开的普通文本对话，安全关闭并提交
-                    if message_item_created:
-                        if content_part_created:
-                            yield make_event("response.output_text.done", {"item_id": item_id, "output_index": output_index, "content_index": 0, "text": full_text})
-                            yield make_event("response.content_part.done", {"item_id": item_id, "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": full_text}})
-                        
-                        text_item = {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": full_text}]}
-                        yield make_event("response.output_item.done", {"output_index": output_index, "item": text_item})
-                        
-                        output_items.append(text_item)
-                        output_index += 1  # 关键修复：工具推移到下一个 Index，避免状态冲突
-
-                    # 2. 结算阶段：如果解析出了工具调用，发送工具请求事件
-                    if tc:
-                        tool_item_id = f"fc_{uuid.uuid4().hex[:8]}"
-                        tool_args = tc["function"]["arguments"]
-                        tool_name = tc["function"]["name"]
-                        
-                        yield make_event("response.output_item.added", {"output_index": output_index, "item": {"id": tool_item_id, "type": "function_call", "status": "in_progress", "call_id": tc['id'], "name": tool_name, "arguments": ""}})
-                        yield make_event("response.function_call_arguments.delta", {"item_id": tool_item_id, "output_index": output_index, "delta": tool_args})
-                        yield make_event("response.function_call_arguments.done", {"item_id": tool_item_id, "output_index": output_index, "arguments": tool_args})
-                        
-                        func_item = {"id": tool_item_id, "type": "function_call", "status": "completed", "call_id": tc['id'], "name": tool_name, "arguments": tool_args}
-                        yield make_event("response.output_item.done", {"output_index": output_index, "item": func_item})
-                        
-                        output_items.append(func_item)
-
-                    # 3. 结算阶段：如果异常情况下没有任何输出，兜底发一个空回复以防止CLI报错
-                    if not output_items:
-                        text_item = {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": ""}]}
-                        yield make_event("response.output_item.added", {"output_index": output_index, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}})
-                        yield make_event("response.output_item.done", {"output_index": output_index, "item": text_item})
-                        output_items.append(text_item)
-
-                    final_resp = {"id": response_id, "object": "response", "created_at": int(time.time()), "status": "completed", "model": model, "output": output_items}
-                    RESPONSES[response_id] = final_resp
-                    yield make_event("response.completed", {"response": final_resp})
-                    yield "data: [DONE]\n\n"
-                    return
-
-                # ------------------------------------
-                # 正常文本流处理（过滤XML及思考过程）
-                # ------------------------------------
-                if "__error__" in chunk:
-                    yield make_event("response.failed", {"error": chunk.get('__error__')})
-                    yield "data: [DONE]\n\n"
-                    return
-
-                choices = chunk.get("choices", [])
-                if not choices:
-                    continue  # Skip chunks with no choices
-                delta_obj = choices[0].get("delta", {})
-                
-                # 分离处理 content 和 reasoning_content
-                # reasoning_content 是思考过程，需要转发给 CLI
-                content_piece = delta_obj.get("content", "")
-                reasoning_piece = delta_obj.get("reasoning_content", "")
-                
-                # 都累积起来，思考过程用  标签包裹
-                piece = ""
-                
-                # 处理 reasoning_content：添加  标签
+            # 分离处理 content 和 reasoning_content
+            # reasoning_content 是思考过程，需要转发给 CLI
+            content_piece = delta_obj.get("content", "")
+            reasoning_piece = delta_obj.get("reasoning_content", "")
+            
+            # 都累积起来，思考过程用  标签包裹
+            piece = ""
+            
+            # 处理 reasoning_content：添加  标签
+            if reasoning_piece:
+                piece += "" + reasoning_piece
+            
+            # 处理 content：如果之前有 reasoning，需要先关闭  标签
+            if content_piece:
                 if reasoning_piece:
-                    piece += "" + reasoning_piece
+                    piece += ""
+                piece += content_piece
                 
-                # 处理 content：如果之前有 reasoning，需要先关闭  标签
-                if content_piece:
-                    if reasoning_piece:
-                        piece += ""
-                    piece += content_piece
-                    
-                if piece:
-                    accumulated += piece
+            if piece:
+                accumulated += piece
 
-                emit_text = get_emit_text(accumulated)
-                new_text = emit_text[emitted_length:]
+            emit_text = get_emit_text(accumulated)
+            new_text = emit_text[emitted_length:]
+            
+            if new_text:
+                if not message_item_created:
+                    message_item_created = True
+                    content_part_created = True
+                    yield make_event("response.output_item.added", {"output_index": 0, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}})
+                    yield make_event("response.content_part.added", {"item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": ""}})
                 
-                if new_text:
-                    if not message_item_created:
-                        message_item_created = True
-                        content_part_created = True
-                        yield make_event("response.output_item.added", {"output_index": 0, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}})
-                        yield make_event("response.content_part.added", {"item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": ""}})
-                    
-                    yield make_event("response.output_text.delta", {"item_id": item_id, "output_index": 0, "content_index": 0, "delta": new_text})
-                    emitted_length = len(emit_text)
-                    full_text += new_text
+                yield make_event("response.output_text.delta", {"item_id": item_id, "output_index": 0, "content_index": 0, "delta": new_text})
+                emitted_length = len(emit_text)
+                full_text += new_text
 
-        return StreamingResponse(stream_events(), media_type="text/event-stream")
+    return StreamingResponse(stream_events(), media_type="text/event-stream")
 
-    # =====================================
-    # NON-STREAMING (兜底)
-    # =====================================
+
+async def _handle_non_stream_response(payload: dict, response_id: str, model: str):
+    """处理非流式响应"""
     async with httpx.AsyncClient(timeout=1800) as client:
         r = await client.post(f"{VLLM_BASE_URL}/v1/chat/completions", json=payload)
     data = r.json()
