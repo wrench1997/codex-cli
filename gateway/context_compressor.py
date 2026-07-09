@@ -8,6 +8,8 @@
 3. 摘要化历史对话（可选，需要额外模型调用）
 """
 
+from __future__ import annotations
+
 import json
 from typing import Any
 
