@@ -1,23 +1,24 @@
-output_file: selected_code.txt
-include:
-  # 🐍 当前项目 Python 源码
-  - "src/codex/*.py"
-  - "src/codex/mcp/*.py"
-  - "gateway/*.py"
-  - "main.py"
-  - "count_src_lines_yaml.py"
-  - "pack_for_ai.py"
-
-  # 📄 配置文件和文档
-  - "*.yaml"
-  - "*.md"
-  - "docs/*.md"
-
-  # 🛡️ 工程执行协议（重要！）
-  - "agent/*.md"
-  - "agent/*.yaml"
-
-# Git 设置（可选）
 git_settings:
-  include_git: true      # 是否包含 git 提交历史
-  commit_limit: 1        # 包含最近多少次提交
+  commit_limit: 5
+  include_git: true
+include:
+- src/codex/pack_for_ai.py
+- src/codex/tools.py
+- src/codex/cli.py
+- src/codex/file_editor.py
+- gateway/context_compressor.py
+- gateway/app.py
+- agent/quality.yaml
+- scripts/generate_key.py
+- gateway/test_context_limit_regex.py
+- gateway/test_context_compressor.py
+- tests/test_gateway_import.py
+- '**/*.py'
+- '**/*.jinja'
+- '**/*.yaml'
+- '**/*.yml'
+- '**/*.toml'
+- '**/*.md'
+- '**/*.bat'
+- '**/*.ps1'
+output_file: selected_code.txt

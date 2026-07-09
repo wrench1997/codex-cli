@@ -412,6 +412,190 @@ def export_single_commit(commit_hash, output_file=None):
         return None
 
 
+def analyze_codebase_for_help(cwd):
+    """
+    分析当前代码库，识别可能需要求助的代码
+    
+    优先级：
+    1. 最近修改的文件（git diff）
+    2. 未提交的改动（git status）
+    3. 最近提交涉及的文件
+    
+    Returns:
+        dict: {
+            'modified_files': list,  # 最近修改的文件
+            'uncommitted_files': list,  # 未提交的文件
+            'recent_commits': list,  # 最近提交信息
+            'suggested_focus': list  # 建议重点关注的文件
+        }
+    """
+    result = {
+        'modified_files': [],
+        'uncommitted_files': [],
+        'recent_commits': [],
+        'suggested_focus': []
+    }
+    
+    # 1. 获取未提交的改动
+    try:
+        status_result = subprocess.run(
+            ["git", "status", "--short"],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            check=True,
+            cwd=cwd
+        )
+        for line in status_result.stdout.strip().split("\n"):
+            if line:
+                # 格式：" M file.py" 或 "?? file.py"
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    file_path = parts[1].strip()
+                    result['uncommitted_files'].append(file_path)
+    except:
+        pass
+    
+    # 2. 获取最近修改的文件（通过 git diff HEAD）
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            check=True,
+            cwd=cwd
+        )
+        for line in diff_result.stdout.strip().split("\n"):
+            if line and line not in result['uncommitted_files']:
+                result['modified_files'].append(line)
+    except:
+        pass
+    
+    # 3. 获取最近提交涉及的文件
+    try:
+        log_result = subprocess.run(
+            ["git", "log", "-5", "--name-only", "--pretty=format:", "--no-merges"],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            check=True,
+            cwd=cwd
+        )
+        files_from_commits = set()
+        for line in log_result.stdout.strip().split("\n"):
+            if line:
+                files_from_commits.add(line)
+        # 只保留 .py, .yaml, .yml, .toml, .md 等源代码文件
+        for f in files_from_commits:
+            if any(f.endswith(ext) for ext in ['.py', '.yaml', '.yml', '.toml', '.md', '.jinja', '.bat', '.ps1']):
+                if f not in result['modified_files'] and f not in result['uncommitted_files']:
+                    result['recent_commits'].append(f)
+    except:
+        pass
+    
+    # 4. 生成建议重点关注的文件列表
+    # 优先级：未提交 > 最近修改 > 最近提交
+    result['suggested_focus'] = (
+        result['uncommitted_files'] + 
+        result['modified_files'] + 
+        result['recent_commits']
+    )
+    
+    return result
+
+
+def generate_smart_config(analysis_result, cwd, config_path):
+    """
+    根据分析结果生成智能配置文件
+    
+    Args:
+        analysis_result: analyze_codebase_for_help 的返回结果
+        cwd: 工作目录
+        config_path: 配置文件路径
+    """
+    print("\n🔍 代码库分析结果:")
+    print("-" * 60)
+    
+    if analysis_result['uncommitted_files']:
+        print(f"📝 未提交的改动 ({len(analysis_result['uncommitted_files'])} 个文件):")
+        for f in analysis_result['uncommitted_files'][:10]:  # 最多显示 10 个
+            print(f"   - {f}")
+        if len(analysis_result['uncommitted_files']) > 10:
+            print(f"   ... 还有 {len(analysis_result['uncommitted_files']) - 10} 个文件")
+    
+    if analysis_result['modified_files']:
+        print(f"\n🔄 最近修改的文件 ({len(analysis_result['modified_files'])} 个文件):")
+        for f in analysis_result['modified_files'][:10]:
+            print(f"   - {f}")
+    
+    if analysis_result['recent_commits']:
+        print(f"\n📜 最近提交涉及的文件 ({len(analysis_result['recent_commits'])} 个文件):")
+        for f in analysis_result['recent_commits'][:10]:
+            print(f"   - {f}")
+    
+    print("-" * 60)
+    
+    # 生成配置
+    config = {
+        "output_file": "selected_code.txt",
+        "include": [],
+        "git_settings": {
+            "include_git": True,
+            "commit_limit": 5
+        }
+    }
+    
+    # 1. 优先添加未提交和最近修改的文件（具体文件路径）
+    focus_files = analysis_result['suggested_focus'][:20]  # 最多 20 个重点文件
+    for f in focus_files:
+        # 确保是相对路径
+        if not os.path.isabs(f):
+            config['include'].append(f)
+        else:
+            config['include'].append(os.path.relpath(f, cwd))
+    
+    # 2. 添加常用的源代码模式（作为补充）
+    default_patterns = [
+        "**/*.py",
+        "**/*.jinja",
+        "**/*.yaml",
+        "**/*.yml",
+        "**/*.toml",
+        "**/*.md",
+        "**/*.bat",
+        "**/*.ps1"
+    ]
+    
+    # 3. 询问用户是否要包含所有源代码文件
+    print("\n💡 建议配置:")
+    print(f"   - 重点文件：{len(focus_files)} 个")
+    print(f"   - 是否包含所有源代码文件？(y/n)")
+    
+    # 非交互模式下默认添加
+    try:
+        # 检查是否在非交互模式
+        if not sys.stdin.isatty():
+            user_input = "y"
+        else:
+            user_input = input("   输入 y 包含所有源代码，n 只包含重点文件：").strip().lower()
+    except:
+        user_input = "y"
+    
+    if user_input == 'y':
+        config['include'].extend(default_patterns)
+        print("   ✅ 已添加所有源代码文件模式")
+    else:
+        print("   ✅ 只包含重点文件")
+    
+    # 写入配置文件
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+    
+    print(f"\n✅ 已更新配置文件：{config_path}")
+    print(f"   包含 {len(config['include'])} 个文件/模式")
+
+
 def main():
     # 获取当前脚本所在目录
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -419,6 +603,9 @@ def main():
     project_root = os.path.dirname(os.path.dirname(current_dir))
     
     # 检查命令行参数
+    auto_analyze = True  # 默认启用自动分析
+    config_path = None
+    
     if len(sys.argv) > 1:
         if sys.argv[1] == "--commit" and len(sys.argv) > 2:
             # 导出单个 commit
@@ -426,38 +613,68 @@ def main():
             sys.exit(0)
         elif sys.argv[1] == "--help":
             print(__doc__)
+            print("\n新增选项:")
+            print("  --no-analyze  跳过自动分析，使用现有配置")
             sys.exit(0)
-        
-        config_path = sys.argv[1]
-    else:
-        # 默认在项目根目录查找配置文件
+        elif sys.argv[1] == "--no-analyze":
+            auto_analyze = False
+            config_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(project_root, "upload_config.yaml")
+        else:
+            config_path = sys.argv[1]
+    
+    if config_path is None:
         config_path = os.path.join(project_root, "upload_config.yaml")
     
     # 检查配置文件是否存在
-    if not os.path.exists(config_path):
-        print(f"❌ 配置文件不存在：{config_path}")
-        print("\n创建示例配置文件...")
+    config_exists = os.path.exists(config_path)
+    
+    if not config_exists:
+        print(f"ℹ️  配置文件不存在：{config_path}")
+        print("\n将自动创建配置文件...")
+    elif auto_analyze:
+        # 询问是否重新分析
+        try:
+            if not sys.stdin.isatty():
+                user_input = "y"
+            else:
+                user_input = input("\n💡 检测到现有配置文件，是否重新分析代码库以优化配置？(y/n): ").strip().lower()
+        except:
+            user_input = "y"
         
-        # 创建示例配置
-        example_config = {
-            "output_file": "packed_for_ai.txt",
-            "include": [
-                "src/**/*.py",
-                "src/**/*.zig",
-                "*.md"
-            ],
-            "git_settings": {
-                "include_git": True,
-                "commit_limit": 1
-            }
-        }
+        if user_input != 'y':
+            auto_analyze = False
+    
+    # 自动分析代码库并生成智能配置
+    if auto_analyze or not config_exists:
+        print("\n🔍 正在分析代码库，识别需要求助的代码...")
+        analysis_result = analyze_codebase_for_help(project_root)
         
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(example_config, f, default_flow_style=False, allow_unicode=True)
-        
-        print(f"✅ 已创建示例配置文件：{config_path}")
-        print("请编辑配置文件后重新运行脚本")
-        sys.exit(0)
+        if analysis_result['suggested_focus']:
+            generate_smart_config(analysis_result, project_root, config_path)
+        else:
+            if not config_exists:
+                # 没有分析结果且配置不存在，创建默认配置
+                print("\n⚠️  未检测到 Git 仓库或改动，创建默认配置...")
+                example_config = {
+                    "output_file": "selected_code.txt",
+                    "include": [
+                        "**/*.py",
+                        "**/*.jinja",
+                        "**/*.yaml",
+                        "**/*.yml",
+                        "**/*.toml",
+                        "**/*.md",
+                        "**/*.bat",
+                        "**/*.ps1"
+                    ],
+                    "git_settings": {
+                        "include_git": True,
+                        "commit_limit": 5
+                    }
+                }
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(example_config, f, default_flow_style=False, allow_unicode=True)
+                print(f"✅ 已创建默认配置文件：{config_path}")
     
     # 加载配置获取 git 设置
     with open(config_path, "r", encoding="utf-8") as f:
@@ -465,7 +682,7 @@ def main():
     
     git_settings = config.get("git_settings", {})
     include_git = git_settings.get("include_git", True)
-    git_limit = git_settings.get("commit_limit", 1)
+    git_limit = git_settings.get("commit_limit", 5)
     
     # 执行打包
     pack_for_ai(
