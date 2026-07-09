@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.codex.web_tools import extract_media_links, search_web, download_youtube_media
+from src.codex.ncm_decrypt_embedded import decrypt_file as ncm_decrypt_file, check_node as ncm_check_node
 from src.codex.file_editor import (
     apply_patch,
     delete_lines,
@@ -444,6 +445,21 @@ TOOLS.extend([
                     "media_type": {"type": "string", "description": "下载格式：mp3 或 mp4", "default": "mp3", "enum": ["mp3", "mp4"]},
                 },
                 "required": ["youtube_url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ncm_decrypt",
+            "description": "解密网易云音乐 NCM 加密文件，返回解密后的音频文件路径和元数据。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_path": {"type": "string", "description": "输入的 NCM 加密文件路径"},
+                    "output_path": {"type": "string", "description": "输出文件路径（可选），如果省略则根据元数据自动生成"},
+                },
+                "required": ["input_path"],
             },
         },
     },
@@ -962,6 +978,18 @@ class ToolExecutor:
                 youtube_url=args.get("youtube_url", ""),
                 media_type=args.get("media_type", "mp3"),
             )
+
+        # ── ncm_decrypt ───────────────────────
+        if name == "ncm_decrypt":
+            input_path = args.get("input_path", "")
+            output_path = args.get("output_path", None)
+            if not input_path:
+                return False, "❌ 参数错误：缺少必填参数 input_path"
+            try:
+                result = ncm_decrypt_file(input_path, output_path)
+                return True, f"✅ NCM 解密成功\n{json.dumps(result, ensure_ascii=False, indent=2)}"
+            except Exception as e:
+                return False, f"❌ NCM 解密失败：{e}"
 
         # ── read_file ──────────────────────────────────
         if name == "read_file":

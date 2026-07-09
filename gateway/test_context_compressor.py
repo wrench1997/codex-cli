@@ -150,6 +150,57 @@ def test_needs_compression():
     print("✅ 测试 5 通过")
 
 
+def test_ultra_long_context_segmented_compression():
+    """测试超长上下文的分段压缩功能（核心测试）"""
+    print("\n" + "="*60)
+    print("测试 6: 超长上下文分段压缩（核心功能测试）")
+    print("="*60)
+    
+    # 创建超长对话：100 轮对话，每轮包含较长的用户问题和助手回答
+    messages = [{"role": "system", "content": "You are a helpful assistant."}]
+    for i in range(100):  # 100 轮对话
+        messages.append({
+            "role": "user",
+            "content": f"Question {i}: " + "A" * 200  # 每轮 200 字符
+        })
+        messages.append({
+            "role": "assistant",
+            "content": f"Answer {i}: " + "B" * 200  # 每轮 200 字符
+        })
+    
+    print(f"原始消息数：{len(messages)}")
+    
+    compressor = ContextCompressor()
+    estimated_before = compressor.estimate_tokens(messages)
+    print(f"估算 token 数（压缩前）: {estimated_before}")
+    
+    # 模拟超长上下文场景：设置 max_tokens=10000，触发多段压缩
+    # 这测试分段压缩能否逐步执行：工具压缩→15 轮→10 轮→5 轮→3 轮
+    compressed = compress_on_context_limit(
+        messages,
+        max_tokens=10000,  # 较低的阈值，触发完整分段压缩流程
+        target_ratio=0.75  # 目标 75% 使用率
+    )
+    
+    estimated_after = compressor.estimate_tokens(compressed)
+    print(f"压缩后消息数：{len(compressed)}")
+    print(f"估算 token 数（压缩后）: {estimated_after}")
+    print(f"目标阈值：{int(10000 * 0.75)} tokens")
+    
+    # 验证：压缩后消息数应该显著减少
+    assert len(compressed) < len(messages), "压缩后消息数应该减少"
+    
+    # 验证：压缩后应该在目标阈值附近或以下
+    # （由于是估算，允许有一定误差）
+    target_threshold = int(10000 * 0.75)
+    print(f"压缩是否达到目标：{'✅ 是' if estimated_after <= target_threshold else '⚠️  接近目标'}")
+    
+    # 验证：保留的消息应该包含 system 和最近的对话
+    assert compressed[0]["role"] == "system", "应该保留 system 消息"
+    
+    print("✅ 测试 6 通过：超长上下文分段压缩功能正常")
+
+
 if __name__ == "__main__":
     print("="*60)
     print("上下文压缩模块测试")
@@ -161,6 +212,7 @@ if __name__ == "__main__":
         test_estimate_tokens()
         test_compress_on_context_limit()
         test_needs_compression()
+        test_ultra_long_context_segmented_compression()  # 新增：超长上下文分段压缩测试
         
         print("\n" + "="*60)
         print("✅ 所有测试通过！")

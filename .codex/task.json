@@ -1,7 +1,7 @@
 {
-  "goal": "研究 y2mate.gs 网页协议，实现一个工具，给定 YouTube URL 就能提取/下载 MP3 或 MP4 文件",
-  "acceptance": "[\"解除 extract_media_links 对 YouTube/y2mate 的限制\", \"实现 download_youtube_media 工具函数\", \"工具能通过 YouTube URL 下载 MP3 文件\", \"工具能通过 YouTube URL 下载 MP4 文件\", \"工具集成到 CLI 工具系统中\"]",
-  "affected_files": "[\"src/codex/web_tools.py\", \"src/codex/tools.py\"]",
+  "goal": "将 ncm_decrypt_embedded.py（网易云音乐 NCM 文件解密工具）集成到 codex-cli 的工具系统中，使其可通过工具调用方式使用",
+  "acceptance": "[\"在 tools.py 的 TOOLS 列表中添加 ncm_decrypt 工具 schema\", \"在 ToolExecutor._dispatch 方法中添加 ncm_decrypt 执行逻辑\", \"工具能正确调用 ncm_decrypt_embedded.py 解密 NCM 文件\", \"验证工具可以正常导入和调用\"]",
+  "affected_files": "[\"src/codex/tools.py\"]",
   "status": "implementing",
   "changed_files": [],
   "verification": {

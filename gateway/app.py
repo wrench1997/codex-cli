@@ -564,66 +564,88 @@ async def vllm_stream(payload):
     context_limit_detected = False  # 上下文超限标志
     
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload_with_usage) as r:
-            async for line in r.aiter_lines():
-                if not line or not line.startswith("data:"): continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    yield "[DONE]"
-                    return
-                try:
-                    chunk = json.loads(data)
+        try:
+            async with client.stream("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload_with_usage) as r:
+                # 检查 HTTP 状态码
+                if r.status_code != 200:
+                    error_text = await r.aread()
+                    error_str = error_text.decode('utf-8', errors='ignore')
+                    print(f"[Gateway] ❌ HTTP 错误 {r.status_code}: {error_str[:500]}")
                     
-                    # 检测错误响应（包括上下文超限）
-                    if "__error__" in chunk or "error" in chunk:
-                        error_msg = chunk.get("__error__", chunk.get("error", ""))
-                        error_str = str(error_msg)
+                    # 检测是否为上下文超限
+                    if CONTEXT_LIMIT_RE.search(error_str):
+                        raise ContextLimitExceededError(f"HTTP {r.status_code}: {error_str}")
+                    else:
+                        raise Exception(f"HTTP {r.status_code}: {error_str}")
+                
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data:"): continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        yield "[DONE]"
+                        return
+                    try:
+                        chunk = json.loads(data)
                         
-                        # 使用正则检测是否为上下文超限错误
-                        if CONTEXT_LIMIT_RE.search(error_str):
-                            context_limit_detected = True
-                            print(f"[Gateway] ⚠️  检测到上下文超限错误：{error_str[:200]}")
-                            # 抛出异常，供上层重试逻辑处理
-                            raise ContextLimitExceededError(f"Context limit exceeded: {error_str}")
-                        else:
-                            print(f"[Gateway] ❌ 检测到其他错误：{error_str[:200]}")
-                            # 其他错误也抛出异常
-                            raise Exception(f"vLLM error: {error_str}")
+                        # 检测错误响应（包括上下文超限）
+                        if "__error__" in chunk or "error" in chunk:
+                            error_msg = chunk.get("__error__", chunk.get("error", ""))
+                            error_str = str(error_msg)
+                            
+                            # 使用正则检测是否为上下文超限错误
+                            if CONTEXT_LIMIT_RE.search(error_str):
+                                context_limit_detected = True
+                                print(f"[Gateway] ⚠️  检测到上下文超限错误：{error_str[:200]}")
+                                # 抛出异常，供上层重试逻辑处理
+                                raise ContextLimitExceededError(f"Context limit exceeded: {error_str}")
+                            else:
+                                print(f"[Gateway] ❌ 检测到其他错误：{error_str[:200]}")
+                                # 其他错误也抛出异常
+                                raise Exception(f"vLLM error: {error_str}")
                     
                     # 测量 TTFT：检测到第一个有内容的 delta 时记录时间
-                    if not first_token_received:
-                        choices = chunk.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            if delta.get("content") or delta.get("reasoning_content"):
-                                ttft_measured = time.perf_counter() - start_time
-                                first_token_received = True
-                                # 将 TTFT 注入到 chunk 中，供后续使用
-                                if "usage" not in chunk:
-                                    chunk["usage"] = {}
-                                chunk["usage"]["ttft"] = ttft_measured
-                    
-                    # 统计 token 使用
-                    if "usage" in chunk and chunk["usage"]:
-                        usage = chunk["usage"]
-                        input_tokens = usage.get("prompt_tokens", 0)
-                        output_tokens = usage.get("completion_tokens", 0)
-                        # 优先使用 vLLM 返回的 TTFT，否则使用测量的 TTFT
-                        ttft = usage.get("ttft", ttft_measured)
-                        if input_tokens > 0 or output_tokens > 0:
-                            billing_stats.add_request(input_tokens, output_tokens, ttft)
-                    yield chunk
-                except Exception as e:
-                    # 捕获异常并检测是否为上下文超限
-                    error_str = str(e)
-                    if CONTEXT_LIMIT_RE.search(error_str):
-                        context_limit_detected = True
-                        print(f"[Gateway] ⚠️  检测到上下文超限异常：{error_str[:200]}")
-                        # 抛出异常，供上层重试逻辑处理
-                        raise ContextLimitExceededError(f"Context limit exceeded: {error_str}")
-                    else:
-                        print(f"[Gateway] ❌ 请求异常：{e}")
-                        raise
+                        if not first_token_received:
+                            choices = chunk.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                if delta.get("content") or delta.get("reasoning_content"):
+                                    ttft_measured = time.perf_counter() - start_time
+                                    first_token_received = True
+                                    # 将 TTFT 注入到 chunk 中，供后续使用
+                                    if "usage" not in chunk:
+                                        chunk["usage"] = {}
+                                    chunk["usage"]["ttft"] = ttft_measured
+                        
+                        # 统计 token 使用
+                        if "usage" in chunk and chunk["usage"]:
+                            usage = chunk["usage"]
+                            input_tokens = usage.get("prompt_tokens", 0)
+                            output_tokens = usage.get("completion_tokens", 0)
+                            # 优先使用 vLLM 返回的 TTFT，否则使用测量的 TTFT
+                            ttft = usage.get("ttft", ttft_measured)
+                            if input_tokens > 0 or output_tokens > 0:
+                                billing_stats.add_request(input_tokens, output_tokens, ttft)
+                        yield chunk
+                    except Exception as e:
+                        # 内层异常处理（JSON 解析错误等）
+                        error_str = str(e)
+                        if CONTEXT_LIMIT_RE.search(error_str):
+                            context_limit_detected = True
+                            print(f"[Gateway] ⚠️  检测到上下文超限异常：{error_str[:200]}")
+                            raise ContextLimitExceededError(f"Context limit exceeded: {error_str}")
+                        else:
+                            print(f"[Gateway] ❌ 请求异常：{e}")
+                            raise
+        except Exception as e:
+            # 外层异常处理（HTTP 错误、连接错误等）
+            error_str = str(e)
+            if CONTEXT_LIMIT_RE.search(error_str):
+                context_limit_detected = True
+                print(f"[Gateway] ⚠️  检测到上下文超限异常：{error_str[:200]}")
+                raise ContextLimitExceededError(f"Context limit exceeded: {error_str}")
+            else:
+                print(f"[Gateway] ❌ 请求异常：{e}")
+                raise
 
 # =========================================================
 # MODELS
@@ -676,8 +698,27 @@ async def responses(req: Request):
     print(f"[Gateway] 完整 payload extra_body: {extra_body}")
     print(f"[Gateway] 顶层 enable_thinking: {payload.get('enable_thinking')}")
     
-    # 上下文压缩重试逻辑
+    # =========================================================
+    # 预判式压缩：在请求前检查是否可能超限
+    # =========================================================
     compressor = ContextCompressor()
+    estimated_tokens = compressor.estimate_tokens(messages)
+    max_context_tokens = 262144  # 模型最大上下文
+    preemptive_threshold = int(max_context_tokens * 0.85)  # 85% 阈值触发预判压缩
+    
+    if estimated_tokens > preemptive_threshold:
+        print(f"[Gateway] 📊 预判式压缩触发：估算 {estimated_tokens} tokens > {preemptive_threshold} 阈值")
+        messages = compress_on_context_limit(
+            messages,
+            compressor=compressor,
+            max_tokens=max_context_tokens,
+            target_ratio=0.75
+        )
+        payload["messages"] = messages
+    
+    # =========================================================
+    # 重试逻辑：处理运行时上下文超限错误
+    # =========================================================
     max_retries = 2  # 最多重试 2 次压缩
     last_error = None
     
@@ -694,11 +735,12 @@ async def responses(req: Request):
             # 检测是否为上下文超限错误
             if attempt < max_retries:
                 print(f"[Gateway] ⚠️  检测到上下文超限，尝试自动压缩（第 {attempt + 1} 次重试）")
-                # 压缩上下文
+                # 压缩上下文（使用分段压缩策略）
                 compressed_messages = compress_on_context_limit(
                     messages, 
                     compressor=compressor, 
-                    max_tokens=262144
+                    max_tokens=262144,
+                    target_ratio=0.75  # 保留 25% 余量
                 )
                 payload["messages"] = compressed_messages
                 # 更新 compressor 配置，下一轮更激进的压缩
