@@ -1,7 +1,7 @@
 {
-  "goal": "设计并实现 vLLM 上下文超限时的自动压缩策略",
-  "acceptance": "[\"查看网关当前错误处理逻辑\", \"测试 vllm 上下文超限错误格式\", \"验证能否用正则捕获上下文超限错误\", \"设计自动压缩上下文的方案\", \"实现上下文压缩模块\", \"在网关中集成自动压缩逻辑\", \"语法检查通过\", \"压缩模块测试通过\"]",
-  "affected_files": "[\"D:\\\\workspace\\\\codex-cli\\\\gateway\\\\app.py\", \"D:\\\\workspace\\\\codex-cli\\\\gateway\\\\context_compressor.py\"]",
+  "goal": "研究 y2mate.gs 网页协议，实现一个工具，给定 YouTube URL 就能提取/下载 MP3 或 MP4 文件",
+  "acceptance": "[\"解除 extract_media_links 对 YouTube/y2mate 的限制\", \"实现 download_youtube_media 工具函数\", \"工具能通过 YouTube URL 下载 MP3 文件\", \"工具能通过 YouTube URL 下载 MP4 文件\", \"工具集成到 CLI 工具系统中\"]",
+  "affected_files": "[\"src/codex/web_tools.py\", \"src/codex/tools.py\"]",
   "status": "implementing",
   "changed_files": [],
   "verification": {

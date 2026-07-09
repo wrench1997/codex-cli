@@ -7,3 +7,5 @@ pathspec
 mcp
 pyyaml
 pywin32
+lxml
+yt-dlp

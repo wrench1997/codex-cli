@@ -11,6 +11,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
+from src.codex.web_tools import extract_media_links, search_web, download_youtube_media
 from src.codex.file_editor import (
     apply_patch,
     delete_lines,
@@ -391,6 +392,62 @@ TOOLS: list[dict] = [
         },
     },
 ]
+
+# 添加联网搜索与网页媒体提取工具
+TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "联网搜索网页资料，返回标题、URL 和摘要。优先使用 BRAVE_SEARCH_API_KEY 或 SEARXNG_URL，未配置时使用 DuckDuckGo HTML 兜底。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "max_results": {"type": "integer", "description": "最多返回结果数，1-20，默认 5", "default": 5},
+                    "provider": {"type": "string", "description": "auto/brave/searxng/duckduckgo_html", "default": "auto"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_media_links",
+            "description": "从网页中提取公开暴露的 mp3/mp4 等媒体直链。支持自动 DOM/文本扫描，也支持传入 XPath 精准捕获。现已支持 YouTube/y2mate 等网站。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "要分析的网页 URL 或直接媒体 URL"},
+                    "media_type": {"type": "string", "description": "all/audio/video/mp3/mp4，默认 all", "default": "all"},
+                    "xpath": {
+                        "type": ["string", "array", "null"],
+                        "items": {"type": "string"},
+                        "description": "可选 XPath，例如 //audio/source/@src 或 //a[contains(@href,'.mp3')]/@href"
+                    },
+                    "max_results": {"type": "integer", "description": "最多返回结果数，1-100，默认 20", "default": 20},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_youtube_media",
+            "description": "从 YouTube URL 下载 MP3 或 MP4 文件。使用 y2mate 协议转换视频。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "youtube_url": {"type": "string", "description": "YouTube 视频 URL，例如 https://youtube.com/watch?v=XXXXX"},
+                    "media_type": {"type": "string", "description": "下载格式：mp3 或 mp4", "default": "mp3", "enum": ["mp3", "mp4"]},
+                },
+                "required": ["youtube_url"],
+            },
+        },
+    },
+])
 
 # 添加 SSH 远程工具（如果模块可用）
 TOOLS.extend(get_remote_tools())
@@ -880,6 +937,30 @@ class ToolExecutor:
                 acceptance_items=args.get("acceptance_items", []),
                 not_in_scope=args.get("not_in_scope", ""),
                 affected_files=args.get("affected_files", [])
+            )
+
+        # ── search_web ─────────────────────────────────
+        if name == "search_web":
+            return search_web(
+                query=args.get("query", ""),
+                max_results=args.get("max_results", 5),
+                provider=args.get("provider", "auto"),
+            )
+
+        # ── extract_media_links ───────────────────────
+        if name == "extract_media_links":
+            return extract_media_links(
+                url=args.get("url", ""),
+                media_type=args.get("media_type", "all"),
+                xpath=args.get("xpath"),
+                max_results=args.get("max_results", 20),
+            )
+
+        # ── download_youtube_media ───────────────────────
+        if name == "download_youtube_media":
+            return download_youtube_media(
+                youtube_url=args.get("youtube_url", ""),
+                media_type=args.get("media_type", "mp3"),
             )
 
         # ── read_file ──────────────────────────────────

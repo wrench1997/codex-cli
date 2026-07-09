@@ -230,6 +230,41 @@ Codex 现在集成了完整的 Git 工具，AI 可以自动调用它们来查看
 
 详细文档：[docs/GIT_TOOLS.md](docs/GIT_TOOLS.md)
 
+### 🆕 媒体下载工具（AI 可自动调用）
+
+Codex 现在支持从 YouTube 等网站下载 MP3/MP4 文件：
+
+| 工具名 | 功能描述 |
+|--------|----------|
+| `extract_media_links` | 从网页中提取公开暴露的 mp3/mp4 等媒体直链，支持 XPath 精准捕获 |
+| `download_youtube_media` | 🌟 从 YouTube URL 下载 MP3 或 MP4 文件，使用 yt-dlp 引擎 |
+
+**使用示例：**
+```python
+# 从 YouTube 下载 MP3
+"帮我把这个 YouTube 视频转成 MP3: https://youtube.com/watch?v=XXXXX"
+→ AI 会自动调用 download_youtube_media(youtube_url="...", media_type="mp3")
+
+# 从 YouTube 下载 MP4
+"下载这个视频：https://youtu.be/XXXXX"
+→ AI 会自动调用 download_youtube_media(youtube_url="...", media_type="mp4")
+
+# 从网页提取媒体链接
+"帮我从这个网页提取所有 MP3 链接：https://mixkit.co/free-stock-music/funk/"
+→ AI 会自动调用 extract_media_links(url="...", media_type="mp3")
+```
+
+**依赖安装：**
+```bash
+# download_youtube_media 需要 yt-dlp
+pip install yt-dlp
+```
+
+**注意事项：**
+- 仅支持下载公开可用的媒体内容
+- 请遵守目标网站的条款和版权规定
+- MP4 下载可能需要较长时间（视频合并处理）
+
 ### 输入技巧
 
 - **多行输入**: 按 `Esc+Enter` 换行，`Enter` 发送
