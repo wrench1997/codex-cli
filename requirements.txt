@@ -9,3 +9,4 @@ pyyaml
 pywin32
 lxml
 yt-dlp
+python-dotenv>=1.0.0

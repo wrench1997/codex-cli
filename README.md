@@ -75,6 +75,7 @@ cp .env.example .env
 
 ```env
 CODEX_API_BASE=http://127.0.0.1:8080/v1
+CODEX_API_MODE=auto
 CODEX_MODEL=Qwen/Qwen3.5-397B-A17B-FP8
 CODEX_API_KEY=your-api-key
 CODEX_TEMPERATURE=0.6
@@ -349,6 +350,11 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8080
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `CODEX_API_BASE` | `http://yourserver:port/v1` | API 基地址 |
+| `CODEX_API_MODE` | `auto` | `responses` 原生 OpenAI、中转站；`gateway` 旧 vLLM XML 网关；`auto` 自动回退 |
+| `CODEX_SEND_TEMPERATURE` | `false` | 是否在原生 Responses 请求中发送 `temperature` |
+| `CODEX_TOOL_TRANSPORT` | `hybrid` | `native` 原生工具；`prompt` XML 文本工具；`hybrid` 同时启用 |
+| `CODEX_TOOL_CHOICE` | `auto` | 原生 Responses 工具选择策略 |
+| `CODEX_DEBUG_REQUESTS` | `false` | 输出请求模式、工具数量和输入项类型 |
 | `CODEX_MODEL` | `Qwen/Qwen3.5-397B-A17B-FP8` | 模型名称 |
 | `CODEX_API_KEY` | `dummy` | API 密钥 |
 | `CODEX_TEMPERATURE` | `0.6` | 采样温度 |

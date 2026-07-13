@@ -13,6 +13,7 @@ Codex CLI - Chat + Agent 持续对话模式
 """
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -320,7 +321,8 @@ SYSTEM_CLIPBOARD = SystemClipboard()
 # ──────────────────────────────────────────────
 # 正则
 # ──────────────────────────────────────────────
-THINK_RE = re.compile(r".*?", re.S)
+# 只移除完整的思考标签；原来的 `.*?` 会匹配任意文本并把正常回复全部清空。
+THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*<function=(?P<name>[^>]+)>\s*(?P<body>.*?)</function>\s*</tool_call>",
     re.S,
@@ -373,19 +375,286 @@ def _normalize_api_base(api_base: str) -> str:
     return base
 
 
+def _to_responses_tools(tools: list[dict]) -> list[dict]:
+    """把 Chat Completions 风格工具定义转换为 Responses 风格。
+
+    旧格式：{"type":"function", "function": {"name": ..., ...}}
+    新格式：{"type":"function", "name": ..., ...}
+
+    本项目部分 JSON Schema 不满足 strict=true 的全部约束，因此显式使用
+    strict=false，避免 Responses API 默认严格模式导致请求被拒绝。
+    """
+    converted: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        if tool.get("type") != "function":
+            converted.append(dict(tool))
+            continue
+
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            item = {
+                "type": "function",
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                "strict": bool(fn.get("strict", False)),
+            }
+        else:
+            item = dict(tool)
+            item.setdefault("strict", False)
+
+        if item.get("name"):
+            converted.append(item)
+
+    return converted
+
+
+def _build_prompt_tool_instructions(tools: list[dict]) -> str:
+    """为不透传原生 tools 的中转站构造文本工具协议。"""
+    flat_tools = _to_responses_tools(tools)
+    if not flat_tools:
+        return ""
+
+    lines = [
+        "# Local tools",
+        "",
+        "You are connected to the user's real local workspace through mcodex tools.",
+        "For any request that depends on files, directories, git state, command output, or the current workspace, you MUST call a tool instead of saying you cannot access the system.",
+        "Available tools:",
+        "<tools>",
+    ]
+    for tool in flat_tools:
+        prompt_tool = {
+            "name": tool.get("name", ""),
+            "description": tool.get("description", ""),
+            "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
+        }
+        lines.append(json.dumps(prompt_tool, ensure_ascii=False, separators=(",", ":")))
+
+    lines.extend([
+        "</tools>",
+        "",
+        "When a tool is needed, output one or more blocks in exactly this XML format:",
+        "<tool_call>",
+        "<function=list_directory>",
+        "<parameter=path>.</parameter>",
+        "<parameter=depth>2</parameter>",
+        "</function>",
+        "</tool_call>",
+        "",
+        "Rules:",
+        "1. Copy the exact tool name from <tools>.",
+        "2. Put JSON for object/array/boolean/number parameter values inside the parameter body.",
+        "3. Do not write anything after the final </tool_call>.",
+        "4. Never claim that you cannot access the local filesystem when a matching tool exists.",
+        "5. After receiving <tool_response>, continue from its real output and call more tools when needed.",
+    ])
+    return "\n".join(lines)
+
+
+def _inject_prompt_tools(input_items: list[dict], tools: list[dict]) -> list[dict]:
+    """复制输入并把文本工具协议附加到首个 system 消息。"""
+    prompt = _build_prompt_tool_instructions(tools)
+    cloned = copy.deepcopy(input_items)
+    if not prompt:
+        return cloned
+
+    for item in cloned:
+        if isinstance(item, dict) and item.get("type", "message") == "message" and item.get("role") == "system":
+            content = item.get("content", "")
+            if isinstance(content, str):
+                item["content"] = f"{content}\n\n{prompt}" if content else prompt
+                return cloned
+
+    cloned.insert(0, {"type": "message", "role": "system", "content": prompt})
+    return cloned
+
+
+def _extract_response_text(response: Optional[dict]) -> str:
+    """兼容原生 Responses 与常见中转实现，提取最终文本。"""
+    if not isinstance(response, dict):
+        return ""
+
+    direct = response.get("output_text")
+    if isinstance(direct, str) and direct:
+        return direct
+
+    parts: list[str] = []
+    for item in response.get("output", []) or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content", [])
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        for part in content or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"output_text", "text", "input_text"}:
+                text = part.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
+    return "".join(parts)
+
+
+def _merge_stream_output_items(
+    response: Optional[dict],
+    completed_items: dict[int, dict],
+) -> dict:
+    """把 SSE output_item 事件合并回最终 response。
+
+    部分 OpenAI 兼容中转站会先通过 ``response.output_item.done``
+    发送完整 function_call，随后却在 ``response.completed`` 中返回空
+    ``output``。不能让最后一个不完整事件覆盖已经收到的工具调用。
+    """
+    merged = dict(response) if isinstance(response, dict) else {}
+    raw_output = merged.get("output")
+    output = list(raw_output) if isinstance(raw_output, list) else []
+
+    if not completed_items:
+        merged["output"] = output
+        return merged
+
+    max_index = max(max(completed_items), len(output) - 1)
+    rebuilt: list[dict] = []
+    for index in range(max_index + 1):
+        final_item = output[index] if index < len(output) and isinstance(output[index], dict) else None
+        event_item = completed_items.get(index)
+
+        if final_item is None and event_item is None:
+            continue
+        if final_item is None:
+            rebuilt.append(dict(event_item))
+            continue
+        if event_item is None:
+            rebuilt.append(dict(final_item))
+            continue
+
+        # 对 function_call，SSE done 事件通常拥有更完整的 arguments/call_id；
+        # 对 message，则优先保留文本更完整的一份。
+        final_type = final_item.get("type")
+        event_type = event_item.get("type")
+        if final_type == event_type == "function_call":
+            item = dict(final_item)
+            for key, value in event_item.items():
+                if value not in (None, "", [], {}):
+                    item[key] = value
+            rebuilt.append(item)
+        elif final_type == event_type == "message":
+            final_text = _extract_response_text({"output": [final_item]})
+            event_text = _extract_response_text({"output": [event_item]})
+            rebuilt.append(dict(event_item if len(event_text) > len(final_text) else final_item))
+        else:
+            # 同一 output_index 理论上应是同一种 item；遇到非标准中转实现时，
+            # 保留最终响应项，并把事件项追加到末尾，避免静默丢工具调用。
+            rebuilt.append(dict(final_item))
+            rebuilt.append(dict(event_item))
+
+    # 去除因非标准事件造成的重复项。优先以 id/call_id 去重。
+    deduped: list[dict] = []
+    seen: set[tuple] = set()
+    for item in rebuilt:
+        key = (
+            item.get("type"),
+            item.get("id") or "",
+            item.get("call_id") or "",
+            item.get("name") or "",
+        )
+        if key in seen and any(key[1:]):
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    merged["output"] = deduped
+    merged.setdefault("object", "response")
+    merged.setdefault("status", "completed")
+    return merged
+
+
+def _normalize_native_tool_calls(output_items: list[dict]) -> list[dict]:
+    """提取并规范化常见 Responses/中转站工具调用形态。"""
+    calls: list[dict] = []
+    for item in output_items or []:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "function_call":
+            calls.append(item)
+            continue
+
+        # 一些中转站沿用 Chat Completions 的嵌套 function 结构。
+        if item_type in {"tool_call", "function"} and isinstance(item.get("function"), dict):
+            fn = item["function"]
+            calls.append({
+                "type": "function_call",
+                "id": item.get("id"),
+                "call_id": item.get("call_id") or item.get("id"),
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", "{}"),
+            })
+            continue
+
+        nested = item.get("function_call")
+        if isinstance(nested, dict):
+            calls.append({
+                "type": "function_call",
+                "id": nested.get("id") or item.get("id"),
+                "call_id": nested.get("call_id") or nested.get("id") or item.get("id"),
+                "name": nested.get("name", ""),
+                "arguments": nested.get("arguments", "{}"),
+            })
+            continue
+
+        # 少数实现把 tool_call 放进 message.content。
+        if item_type == "message":
+            content = item.get("content", [])
+            if isinstance(content, list):
+                calls.extend(_normalize_native_tool_calls([part for part in content if isinstance(part, dict)]))
+
+    return calls
+
+
+def _parse_tool_calls(text: str) -> list[dict]:
+    """解析模型文本中的一个或多个 XML 工具调用。"""
+    calls: list[dict] = []
+    for index, match in enumerate(TOOL_CALL_RE.finditer(text or "")):
+        name = match.group("name").strip()
+        body = match.group("body")
+        args: dict[str, Any] = {}
+        for param in PARAM_RE.finditer(body):
+            raw = param.group("value").strip()
+            try:
+                args[param.group("name").strip()] = json.loads(raw)
+            except json.JSONDecodeError:
+                args[param.group("name").strip()] = raw
+
+        suffix = f"{int(time.time() * 1000)}_{index}"
+        calls.append({
+            "type": "function_call",
+            "id": f"fc_prompt_{suffix}",
+            "call_id": f"call_prompt_{suffix}",
+            "name": name,
+            "arguments": json.dumps(args, ensure_ascii=False),
+            "_mcodex_transport": "prompt",
+        })
+    return calls
+
+
+def _strip_tool_call_blocks(text: str) -> str:
+    """移除完整 XML 工具调用块，只保留给用户看的自然语言。"""
+    return TOOL_CALL_RE.sub("", text or "").strip()
+
+
 def _parse_tool_call(text: str) -> Optional[dict]:
-    m = TOOL_CALL_RE.search(text)
-    if not m:
+    """向后兼容旧调用方，只返回第一个文本工具调用。"""
+    calls = _parse_tool_calls(text)
+    if not calls:
         return None
-    name = m.group("name").strip()
-    body = m.group("body")
-    args: dict[str, Any] = {}
-    for p in PARAM_RE.finditer(body):
-        raw = p.group("value").strip()
-        try:
-            args[p.group("name").strip()] = json.loads(raw)
-        except json.JSONDecodeError:
-            args[p.group("name").strip()] = raw
+    name, args, _call_id = _extract_function_call(calls[0])
     return {"name": name, "arguments": args}
 
 
@@ -765,6 +1034,10 @@ class ChatAgent:
 
         self.api_base = _normalize_api_base(api_base or CONFIG.api_base)
         self.model = model or CONFIG.model
+        self.api_mode = CONFIG.api_mode
+        self.tool_transport = CONFIG.tool_transport
+        self._resolved_api_mode: Optional[str] = None if self.api_mode == "auto" else self.api_mode
+        self._last_request_mode: Optional[str] = self._resolved_api_mode
 
         # 统计
         self.turn_count = 0
@@ -878,6 +1151,110 @@ class ChatAgent:
             "output": output,
         })
 
+    def add_prompt_tool_result(
+        self,
+        name: str,
+        call_id: Optional[str],
+        success: bool,
+        output: str,
+    ):
+        """把本地工具结果包装成普通消息，兼容不理解 function_call_output 的中转站。"""
+        payload = {
+            "name": name,
+            "call_id": call_id or f"call_prompt_{int(time.time() * 1000)}",
+            "success": success,
+            "output": output,
+        }
+        self.input_items.append({
+            "type": "message",
+            "role": "user",
+            "content": (
+                "<tool_response>\n"
+                + json.dumps(payload, ensure_ascii=False)
+                + "\n</tool_response>\n"
+                + "以上是 mcodex 在真实本地环境执行工具后的结果。请基于结果继续完成用户请求；"
+                + "需要更多信息时继续调用工具，不要声称无法访问本地文件系统。"
+            ),
+        })
+
+    def add_response_output_items(self, items: list[dict]):
+        """保留原生 Responses 输出项，确保 reasoning/function_call 不会丢失。"""
+        for item in items:
+            if isinstance(item, dict):
+                self.input_items.append(dict(item))
+
+    def _combined_tools(self) -> list[dict]:
+        if not self.agent_mode:
+            return []
+        combined = TOOLS.copy()
+        if self.mcp_manager:
+            combined.extend(self.mcp_manager.get_all_tools() or [])
+        return combined
+
+    def _candidate_api_modes(self) -> list[str]:
+        if self._resolved_api_mode:
+            return [self._resolved_api_mode]
+        return ["responses", "gateway"]
+
+    def _build_responses_payload(
+        self,
+        mode: str,
+        *,
+        stream: bool,
+        input_items: Optional[list[dict]] = None,
+        include_tools: bool = True,
+    ) -> dict:
+        source_input = input_items if input_items is not None else self.input_items
+        tools = self._combined_tools() if include_tools else []
+
+        request_input = source_input
+        if (
+            mode == "responses"
+            and tools
+            and self.tool_transport in {"prompt", "hybrid"}
+        ):
+            request_input = _inject_prompt_tools(source_input, tools)
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": request_input,
+            "stream": stream,
+        }
+
+        if mode == "responses":
+            if tools and self.tool_transport in {"native", "hybrid"}:
+                payload["tools"] = _to_responses_tools(tools)
+                payload["tool_choice"] = CONFIG.tool_choice
+            if CONFIG.send_temperature:
+                payload["temperature"] = CONFIG.temperature
+        else:
+            # 旧 vLLM 网关使用 Chat Completions 风格工具 schema，并识别
+            # enable_thinking 私有字段。
+            if tools:
+                payload["tools"] = tools
+            payload["temperature"] = CONFIG.temperature
+            payload["enable_thinking"] = True
+
+        return payload
+
+    def _debug_request_payload(self, payload: dict, mode: str):
+        if not CONFIG.debug_requests:
+            return
+        tools = payload.get("tools", []) or []
+        tool_names = [
+            tool.get("name") or (tool.get("function") or {}).get("name")
+            for tool in tools if isinstance(tool, dict)
+        ]
+        input_types = []
+        for item in payload.get("input", []) or []:
+            if isinstance(item, dict):
+                input_types.append(item.get("type") or item.get("role") or "unknown")
+        console.print(
+            "[dim]DEBUG request: "
+            f"mode={mode}, transport={self.tool_transport}, tools={len(tool_names)}, "
+            f"first_tools={tool_names[:6]}, input_types={input_types[-8:]}[/dim]"
+        )
+
     def history_summary(self) -> str:
         """返回对话历史摘要。"""
         lines = [f"共 {len(self.input_items)} 条消息，{self.turn_count} 轮对话，{self.tool_call_count} 次工具调用\n"]
@@ -902,7 +1279,7 @@ class ChatAgent:
     # ── 记忆与上下文压缩 ──────────────────────────────────────
 
     async def _generate_summary(self, old_messages_text: str) -> str:
-        """调用大模型，生成结构化记忆总结"""
+        """调用大模型，生成结构化记忆总结。"""
         prompt = f"""你是一个 AI 架构师的记忆管理模块。请总结以下历史对话记录，提取对后续编程任务有用的核心信息。
 要求尽可能简练，保留关键的文件路径、函数名、已经验证的结论和当前的报错信息。
 
@@ -917,34 +1294,54 @@ class ChatAgent:
 {old_messages_text}
 --------------------
 """
-        payload = {
-            "model": self.model,
-            "input": [{"type": "message", "role": "user", "content": prompt}],
-            "stream": False,
-            "temperature": 0.1,  # 总结任务需要低温度，保证客观真实
-        }
-
+        input_items = [{"type": "message", "role": "user", "content": prompt}]
         headers = {}
         if CONFIG.api_key and CONFIG.api_key != "dummy":
             headers["Authorization"] = f"Bearer {CONFIG.api_key}"
 
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{self.api_base}/responses",
-                    json=payload,
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                # 提取返回文本
-                output_items = data.get("output", [])
-                if output_items and output_items[0].get("content"):
-                    return output_items[0]["content"][0]["text"]
-        except Exception as e:
-            return f"（压缩上下文失败，错误：{e}）"
+        last_error = "未知错误"
+        for mode in self._candidate_api_modes():
+            payload = self._build_responses_payload(
+                mode,
+                stream=False,
+                input_items=input_items,
+                include_tools=False,
+            )
+            if mode == "gateway" or CONFIG.send_temperature:
+                payload["temperature"] = 0.1
 
-        return "（未生成有效总结）"
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(
+                        f"{self.api_base}/responses",
+                        json=payload,
+                        headers=headers,
+                    )
+                if resp.status_code >= 400:
+                    last_error = f"HTTP {resp.status_code}: {resp.text[:500]}"
+                    if (
+                        self.api_mode == "auto"
+                        and self._resolved_api_mode is None
+                        and mode == "responses"
+                        and resp.status_code in {400, 404, 405, 415, 422, 500, 501}
+                    ):
+                        continue
+                    return f"（压缩上下文失败，错误：{last_error}）"
+
+                data = resp.json()
+                self._resolved_api_mode = mode
+                self._last_request_mode = mode
+                text = _extract_response_text(data)
+                if text:
+                    return text
+                last_error = "接口返回中没有可识别的文本 output"
+            except Exception as e:
+                last_error = str(e)
+                if self.api_mode == "auto" and self._resolved_api_mode is None and mode == "responses":
+                    continue
+                break
+
+        return f"（压缩上下文失败，错误：{last_error}）"
 
     async def compress_context(self):
         """执行上下文压缩"""
@@ -999,82 +1396,203 @@ class ChatAgent:
         on_token: Any = None,   # async callback(str)
         cancel_event: Any = None,  # asyncio.Event - 用于取消生成
     ) -> tuple[str, Optional[dict]]:
-        """
-        调用 gateway /v1/responses，流式接收。
-        返回 (visible_stream_text, final_response_dict)
-        """
-        payload = {
-            "model": self.model,
-            "input": self.input_items,
-            "stream": True,
-            "temperature": CONFIG.temperature,
-            "enable_thinking": True,  # 显式开启思考模式
-        }
-
-        if self.agent_mode:
-            # 动态合并原生工具和 MCP 工具
-            combined_tools = TOOLS.copy()
-            if self.mcp_manager:
-                mcp_tools = self.mcp_manager.get_all_tools()
-                if mcp_tools:
-                    combined_tools.extend(mcp_tools)
-            payload["tools"] = combined_tools
-
+        """调用 /v1/responses，并兼容原生 Responses 与旧 vLLM 网关。"""
         headers = {}
         if CONFIG.api_key and CONFIG.api_key != "dummy":
             headers["Authorization"] = f"Bearer {CONFIG.api_key}"
 
-        stream_parts: list[str] = []
-        final_response: Optional[dict] = None
+        fallback_statuses = {400, 404, 405, 415, 422, 500, 501}
+        last_http_error = ""
 
-        try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream(
-                    "POST",
-                    f"{self.api_base}/responses",
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    resp.raise_for_status()
+        for mode in self._candidate_api_modes():
+            payload = self._build_responses_payload(mode, stream=True)
+            self._debug_request_payload(payload, mode)
+            stream_parts: list[str] = []
+            final_response: Optional[dict] = None
+            completed_items: dict[int, dict] = {}
 
-                    async for line in resp.aiter_lines():
-                        # 检查取消事件
-                        if cancel_event and cancel_event.is_set():
-                            raise asyncio.CancelledError("用户取消了生成")
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{self.api_base}/responses",
+                        json=payload,
+                        headers=headers,
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            raw_error = await resp.aread()
+                            error_text = raw_error.decode("utf-8", errors="replace")
+                            last_http_error = f"HTTP {resp.status_code}: {error_text[:1000]}"
+                            if (
+                                self.api_mode == "auto"
+                                and self._resolved_api_mode is None
+                                and mode == "responses"
+                                and resp.status_code in fallback_statuses
+                            ):
+                                console.print(
+                                    "[yellow]⚠️ 原生 Responses 协议被当前服务拒绝，"
+                                    "自动回退到旧 gateway 兼容模式。[/yellow]"
+                                )
+                                continue
+                            raise RuntimeError(last_http_error)
 
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            evt = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
+                        content_type = resp.headers.get("content-type", "").lower()
+                        if "text/event-stream" not in content_type:
+                            raw = await resp.aread()
+                            try:
+                                final_response = json.loads(raw.decode("utf-8"))
+                            except json.JSONDecodeError as e:
+                                raise RuntimeError(
+                                    "接口未返回 SSE，也不是有效 JSON："
+                                    + raw.decode("utf-8", errors="replace")[:500]
+                                ) from e
 
-                        etype = evt.get("type", "")
+                            if isinstance(final_response, dict) and final_response.get("error"):
+                                raise RuntimeError(json.dumps(final_response["error"], ensure_ascii=False))
 
-                        if etype == "response.output_text.delta":
-                            delta = evt.get("delta", "")
-                            if delta:
-                                stream_parts.append(delta)
+                            text = _extract_response_text(final_response)
+                            if text:
+                                stream_parts.append(text)
                                 if on_token:
-                                    await on_token(delta)
+                                    await on_token(text)
+                        else:
+                            async for line in resp.aiter_lines():
+                                if cancel_event and cancel_event.is_set():
+                                    raise asyncio.CancelledError("用户取消了生成")
 
-                        elif etype == "response.failed":
-                            err = evt.get("error", "Unknown error")
-                            raise RuntimeError(
-                                json.dumps(err, ensure_ascii=False)
-                                if isinstance(err, dict) else str(err)
-                            )
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    evt = json.loads(data)
+                                except json.JSONDecodeError:
+                                    continue
 
-                        elif etype == "response.completed":
-                            final_response = evt.get("response")
+                                if not isinstance(evt, dict):
+                                    continue
+                                etype = evt.get("type", "")
 
-        except httpx.HTTPStatusError as e:
-            raise RuntimeError(f"HTTP {e.response.status_code}: {e.response.text[:200]}")
+                                if etype == "response.output_text.delta":
+                                    delta = evt.get("delta", "")
+                                    if isinstance(delta, str) and delta:
+                                        stream_parts.append(delta)
+                                        if on_token:
+                                            await on_token(delta)
 
-        return "".join(stream_parts), final_response
+                                elif etype in {"response.output_item.added", "response.output_item.done"}:
+                                    item = evt.get("item")
+                                    index = evt.get("output_index", len(completed_items))
+                                    if isinstance(item, dict):
+                                        try:
+                                            completed_items[int(index)] = dict(item)
+                                        except (TypeError, ValueError):
+                                            completed_items[len(completed_items)] = dict(item)
+
+                                elif etype in {
+                                    "response.function_call_arguments.delta",
+                                    "response.function_call_arguments.done",
+                                }:
+                                    raw_index = evt.get("output_index", 0)
+                                    try:
+                                        index = int(raw_index)
+                                    except (TypeError, ValueError):
+                                        index = 0
+                                    item = completed_items.setdefault(index, {
+                                        "type": "function_call",
+                                        "id": evt.get("item_id") or evt.get("id"),
+                                        "call_id": evt.get("call_id"),
+                                        "name": evt.get("name", ""),
+                                        "arguments": "",
+                                    })
+                                    if evt.get("item_id") and not item.get("id"):
+                                        item["id"] = evt["item_id"]
+                                    if evt.get("call_id"):
+                                        item["call_id"] = evt["call_id"]
+                                    if evt.get("name"):
+                                        item["name"] = evt["name"]
+                                    if etype.endswith(".delta"):
+                                        delta = evt.get("delta", "")
+                                        if isinstance(delta, str):
+                                            item["arguments"] = str(item.get("arguments", "")) + delta
+                                    else:
+                                        arguments = evt.get("arguments")
+                                        if isinstance(arguments, str):
+                                            item["arguments"] = arguments
+
+                                elif etype in {"response.failed", "response.incomplete", "error"}:
+                                    response_error = evt.get("response")
+                                    if isinstance(response_error, dict):
+                                        response_error = response_error.get("error") or response_error.get("incomplete_details")
+                                    err = evt.get("error") or response_error or evt
+                                    raise RuntimeError(
+                                        json.dumps(err, ensure_ascii=False)
+                                        if isinstance(err, dict) else str(err)
+                                    )
+
+                                elif etype == "response.completed":
+                                    response_obj = evt.get("response")
+                                    if isinstance(response_obj, dict):
+                                        final_response = response_obj
+
+                # 无论 response.completed 是否存在，都要把已经收到的 output_item
+                # 合并进去。部分中转站的 completed 事件只有 status，若直接覆盖会
+                # 丢失 function_call，表现为终端空白且工具面板不出现。
+                final_response = _merge_stream_output_items(final_response, completed_items)
+
+                # 某些中转站只发文本 delta，却不在 completed/output_item.done 中附带 message。
+                # 合成一个 message，确保下一轮历史里不会丢失模型的自然语言回复。
+                streamed_text = "".join(stream_parts)
+                if streamed_text and not _extract_response_text(final_response):
+                    output = final_response.setdefault("output", [])
+                    message_item = next(
+                        (
+                            item for item in output
+                            if isinstance(item, dict) and item.get("type") == "message"
+                        ),
+                        None,
+                    )
+                    if message_item is None:
+                        output.append({
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": streamed_text}],
+                        })
+                    elif not message_item.get("content"):
+                        message_item["content"] = [{"type": "output_text", "text": streamed_text}]
+
+                # 某些中转站不发 output_text.delta，只在 completed 中给最终文本。
+                if not stream_parts:
+                    final_text = _extract_response_text(final_response)
+                    if final_text:
+                        stream_parts.append(final_text)
+                        if on_token:
+                            await on_token(final_text)
+
+                if CONFIG.debug_requests:
+                    normalized_calls = _normalize_native_tool_calls(final_response.get("output", []) or [])
+                    console.print(
+                        "[dim]DEBUG response: "
+                        f"streamed_chars={len(streamed_text)}, "
+                        f"event_items={len(completed_items)}, "
+                        f"final_items={len(final_response.get('output', []) or [])}, "
+                        f"tool_calls={len(normalized_calls)}, "
+                        f"status={final_response.get('status')}[/dim]"
+                    )
+
+                self._resolved_api_mode = mode
+                self._last_request_mode = mode
+                return "".join(stream_parts), final_response
+
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPError as e:
+                # 网络级错误不说明协议不兼容，避免重复执行同一次请求。
+                raise RuntimeError(f"请求 Responses API 失败：{e}") from e
+
+        raise RuntimeError(last_http_error or "Responses API 请求失败")
 
     # ── 核心 turn 逻辑 ────────────────────────────────────
 
@@ -1107,21 +1625,59 @@ class ChatAgent:
         for _loop in range(CONFIG.max_turns):
             # ── 流式调用模型 ──────────────────────────────
             stream_text, final_response = await self._stream_request(on_token=on_token, cancel_event=cancel_event)
-            visible_text = _strip_think(stream_text)
+            response_text = stream_text or _extract_response_text(final_response)
+            visible_text = _strip_tool_call_blocks(_strip_think(response_text))
 
             # ── 解析工具调用 ──────────────────────────────
-            output_items = (final_response or {}).get("output", [])
-            tool_calls = [
-                item for item in output_items
-                if item.get("type") == "function_call"
-            ]
+            output_items = (final_response or {}).get("output", []) or []
+            native_tool_calls = _normalize_native_tool_calls(output_items)
+            prompt_tool_calls: list[dict] = []
+            if (
+                not native_tool_calls
+                and self.agent_mode
+                and self.tool_transport in {"prompt", "hybrid"}
+            ):
+                # 一些中转站会把工具调用作为 message 内的 XML 文本返回。
+                prompt_tool_calls = _parse_tool_calls(response_text)
+
+            tool_calls = native_tool_calls or prompt_tool_calls
+            if native_tool_calls:
+                tool_call_transport = "native"
+            elif prompt_tool_calls:
+                tool_call_transport = "prompt"
+            else:
+                tool_call_transport = "none"
+
+            # 原生 output items（普通 message/reasoning/function_call）应原样保留；
+            # 只有文本/XML 工具调用需要改用普通消息历史。
+            native_history_added = (
+                self._last_request_mode == "responses"
+                and bool(output_items)
+                and tool_call_transport != "prompt"
+            )
+            if native_history_added:
+                self.add_response_output_items(output_items)
 
             # 没有工具调用 → 检查是否可以结束
             if not tool_calls:
+                if not visible_text.strip():
+                    status = (final_response or {}).get("status", "unknown")
+                    item_types = [
+                        item.get("type", "unknown")
+                        for item in output_items
+                        if isinstance(item, dict)
+                    ]
+                    raise RuntimeError(
+                        "中转站返回了空响应：没有文本，也没有可识别的工具调用。"
+                        f" status={status}, output_types={item_types}. "
+                        "请临时设置 CODEX_DEBUG_REQUESTS=true 查看协议摘要。"
+                    )
+
                 # 关键门禁：如果代码已修改但未验证，强制要求验证
                 if self.task_state.dirty and not self.task_state.can_finish():
                     # 自动插入系统消息，要求模型执行验证
-                    self.add_assistant(visible_text)
+                    if not native_history_added:
+                        self.add_assistant(visible_text)
                     
                     # 构建详细的门禁消息，明确列出未完成项
                     acceptance_items = self.task_state.acceptance_items
@@ -1149,21 +1705,27 @@ class ChatAgent:
                     continue  # 继续循环，让模型回应
 
                 # 把 assistant 回复加入历史
-                self.add_assistant(visible_text)
+                if not native_history_added:
+                    self.add_assistant(visible_text)
                 return visible_text
 
             # ── 有工具调用 ────────────────────────────────
-            # 先把 assistant 消息（含 XML 表示的工具调用）加入历史
-            xml_blocks = []
-            for item in tool_calls:
-                name, args, _cid = _extract_function_call(item)
-                xml_blocks.append(_build_xml_tool_call(name, args))
+            if not native_history_added:
+                if tool_call_transport == "prompt" and response_text.strip():
+                    # 保留模型原始 XML；UI 隐藏标签，但下一轮模型需要看到调用记录。
+                    self.add_assistant(_strip_think(response_text).strip())
+                else:
+                    # 旧 vLLM gateway 的 function_call 转回 XML 历史。
+                    xml_blocks = []
+                    for item in tool_calls:
+                        name, args, _cid = _extract_function_call(item)
+                        xml_blocks.append(_build_xml_tool_call(name, args))
 
-            combined = visible_text.strip()
-            xml_str = "\n\n".join(xml_blocks)
-            if xml_str:
-                combined = f"{combined}\n\n{xml_str}" if combined else xml_str
-            self.add_assistant(combined)
+                    combined = visible_text.strip()
+                    xml_str = "\n\n".join(xml_blocks)
+                    if xml_str:
+                        combined = f"{combined}\n\n{xml_str}" if combined else xml_str
+                    self.add_assistant(combined)
 
             # ── 逐个执行工具 ──────────────────────────────
             user_rejected = False  # 标记是否有用户拒绝的操作
@@ -1235,7 +1797,10 @@ class ChatAgent:
                             output = "用户拒绝了此操作。"
                         success = False
                         # 把已拒绝的结果加入历史后，立即停止后续工具调用
-                        self.add_tool_result(call_id, output)
+                        if item.get("_mcodex_transport") == "prompt":
+                            self.add_prompt_tool_result(name, call_id, success, output)
+                        else:
+                            self.add_tool_result(call_id, output)
                         if on_tool_result:
                             await on_tool_result(name, success, output)
                         break  # 跳出工具循环
@@ -1243,8 +1808,12 @@ class ChatAgent:
                 if on_tool_result:
                     await on_tool_result(name, success, output)
 
-                # 把工具结果加入历史
-                self.add_tool_result(call_id, output)
+                # 把工具结果加入历史。文本/XML 调用使用普通消息回传；
+                # 原生 Responses 调用使用相同 call_id 的 function_call_output。
+                if item.get("_mcodex_transport") == "prompt":
+                    self.add_prompt_tool_result(name, call_id, success, output)
+                else:
+                    self.add_tool_result(call_id, output)
 
             # 更新任务状态：如果有文件被修改
             if modified_files:
@@ -1767,9 +2336,10 @@ async def _process_message(
 
     async def on_tool_result(name: str, success: bool, output: str):
         print_tool_result_panel(name, success, output)
-        # 工具结果后，模型继续生成，重启渲染器
+        # 只重置，不提前打印空的 “Codex” 前缀。下一轮真正收到文本时
+        # StreamRenderer.feed() 会自动启动；若下一轮仍是工具调用，也不会
+        # 留下一个看似被覆盖的空回复行。
         renderer.reset()
-        renderer.start()
 
     async def on_pending(path_line: str, diff_text: str) -> tuple[bool, Optional[str]]:
         return await ask_approval(path_line, diff_text)
@@ -1863,8 +2433,11 @@ async def _process_message(
               help="自动审批所有文件修改")
 @click.option("--model", "-m", default=None,
               help="指定模型名称")
-@click.option("--api", default="http://127.0.0.1:8080/v1",
-              help="API 基地址（例如 http://127.0.0.1:8080/v1）")
+@click.option("--api", default=None,
+              help="API 基地址；未指定时读取 CODEX_API_BASE")
+@click.option("--api-mode", type=click.Choice(["auto", "responses", "gateway"], case_sensitive=False),
+              default=None,
+              help="接口模式：responses=原生中转/官方，gateway=旧 vLLM 网关，auto=自动识别")
 @click.option("--no-agent", "no_agent", is_flag=True, default=False,
               help="纯聊天模式，不使用工具")
 @click.option("--temperature", "-t", default=None, type=float,
@@ -1877,7 +2450,7 @@ async def _process_message(
               help="虚拟文件系统模式：自动启动 RJCut Studio Electron 应用并连接 MCP 服务器，屏蔽本地文件操作工具")
 @click.option("--vfs-port", type=int, default=8001,
               help="VFS MCP 服务器端口（默认：8001）")
-def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mcp_config, vfs_mode, vfs_port):
+def main(task, workdir, auto_approve, model, api, api_mode, no_agent, temperature, mcp, mcp_config, vfs_mode, vfs_port):
     """
     Codex Chat — 持续对话的 AI 编程助手
 
@@ -1889,6 +2462,8 @@ def main(task, workdir, auto_approve, model, api, no_agent, temperature, mcp, mc
         CONFIG.model = model
     if api:
         CONFIG.api_base = api
+    if api_mode:
+        CONFIG.api_mode = api_mode.lower()
     if temperature is not None:
         CONFIG.temperature = temperature
 
