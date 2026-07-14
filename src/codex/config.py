@@ -1,21 +1,128 @@
 # config.py
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _as_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_codex_env() -> tuple[Path, ...]:
+    """加载 mcodex 配置文件。
+
+    默认让项目根目录 ``.env`` 覆盖 Windows 会话里残留的 CODEX_* 变量，
+    这样修改文件后重新启动即可生效。需要保留系统环境变量优先级时，可在
+    启动前设置 ``CODEX_ENV_OVERRIDE=false``。
+
+    也可以通过 ``CODEX_ENV_FILE`` 指向另一份配置文件；显式文件最后加载，
+    因而优先级最高。
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return ()
+
+    project_root = Path(__file__).resolve().parents[2]
+    candidates = [project_root / ".env"]
+
+    explicit = os.environ.get("CODEX_ENV_FILE", "").strip()
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+
+    override = _as_bool(os.environ.get("CODEX_ENV_OVERRIDE"), default=True)
+    loaded: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate.absolute()
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        load_dotenv(resolved, override=override)
+        loaded.append(resolved)
+    return tuple(loaded)
+
+
+LOADED_ENV_FILES = _load_codex_env()
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
 
 
 @dataclass
 class Config:
-    api_base: str = os.environ.get("CODEX_API_BASE", "http://112.111.7.91:7980/v1")
-    model: str = os.environ.get("CODEX_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8")
-    api_key: str = os.environ.get("CODEX_API_KEY", "dummy")
-    temperature: float = float(os.environ.get("CODEX_TEMPERATURE", "0.6"))
-    max_turns: int = int(os.environ.get("CODEX_MAX_TURNS", "50"))
-    auto_approve: bool = os.environ.get("CODEX_AUTO_APPROVE", "false").lower() == "true"
-    workspace: str = os.environ.get("CODEX_WORKSPACE", os.getcwd())
-    
-    # 新增：上下文压缩相关的配置
-    max_context_tokens: int = int(os.environ.get("CODEX_MAX_CONTEXT_TOKENS", "140000"))  # 触发压缩的阈值
-    keep_recent_turns: int = int(os.environ.get("CODEX_KEEP_RECENT_TURNS", "6"))      # 压缩时保留最近几轮对话不压缩
+    api_base: str = field(default_factory=lambda: _env("CODEX_API_BASE", "http://127.0.0.1:8080/v1"))
+    model: str = field(default_factory=lambda: _env("CODEX_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8"))
+    api_key: str = field(default_factory=lambda: _env("CODEX_API_KEY", "dummy"))
+    temperature: float = field(default_factory=lambda: float(_env("CODEX_TEMPERATURE", "0.6")))
+    max_turns: int = field(default_factory=lambda: int(_env("CODEX_MAX_TURNS", "50")))
+    auto_approve: bool = field(default_factory=lambda: _as_bool(os.environ.get("CODEX_AUTO_APPROVE")))
+    workspace: str = field(default_factory=lambda: _env("CODEX_WORKSPACE", os.getcwd()))
+
+    # API 兼容模式：
+    # - responses: 原生 OpenAI Responses API
+    # - chat:      OpenAI Chat Completions API
+    # - gateway:   旧 vLLM XML 工具网关
+    # - auto:      依次尝试 responses、chat、gateway
+    api_mode: str = field(default_factory=lambda: _env("CODEX_API_MODE", "auto").strip().lower())
+
+    # GPT-5 系列及部分中转站不接受 temperature。
+    send_temperature: bool = field(default_factory=lambda: _as_bool(os.environ.get("CODEX_SEND_TEMPERATURE")))
+
+    # 工具传输方式：
+    # - native: 仅使用 API 原生 function calling
+    # - prompt: 仅把工具 schema 注入提示词并解析文本工具调用（中转站推荐）
+    # - hybrid: 两者同时启用
+    tool_transport: str = field(default_factory=lambda: _env("CODEX_TOOL_TRANSPORT", "prompt").strip().lower())
+    tool_choice: str = field(default_factory=lambda: _env("CODEX_TOOL_CHOICE", "auto").strip().lower())
+    debug_requests: bool = field(default_factory=lambda: _as_bool(os.environ.get("CODEX_DEBUG_REQUESTS")))
+    agent_refusal_retries: int = field(default_factory=lambda: int(_env("CODEX_AGENT_REFUSAL_RETRIES", "2")))
+
+    max_context_tokens: int = field(default_factory=lambda: int(_env("CODEX_MAX_CONTEXT_TOKENS", "140000")))
+    keep_recent_turns: int = field(default_factory=lambda: int(_env("CODEX_KEEP_RECENT_TURNS", "6")))
+
+    def __post_init__(self):
+        aliases = {
+            "native": "responses",
+            "openai": "responses",
+            "chat_completions": "chat",
+            "chat-completions": "chat",
+            "completions": "chat",
+            "legacy": "gateway",
+            "vllm": "gateway",
+        }
+        self.api_mode = aliases.get(self.api_mode, self.api_mode)
+        if self.api_mode not in {"auto", "responses", "chat", "gateway"}:
+            raise ValueError(
+                "CODEX_API_MODE 必须是 auto、responses、chat 或 gateway，"
+                f"当前值：{self.api_mode!r}"
+            )
+
+        tool_aliases = {
+            "xml": "prompt",
+            "text": "prompt",
+            "both": "hybrid",
+            "compat": "hybrid",
+        }
+        self.tool_transport = tool_aliases.get(self.tool_transport, self.tool_transport)
+        if self.tool_transport not in {"native", "prompt", "hybrid"}:
+            raise ValueError(
+                "CODEX_TOOL_TRANSPORT 必须是 native、prompt 或 hybrid，"
+                f"当前值：{self.tool_transport!r}"
+            )
+        if self.tool_choice not in {"auto", "required", "none"}:
+            raise ValueError(
+                "CODEX_TOOL_CHOICE 必须是 auto、required 或 none，"
+                f"当前值：{self.tool_choice!r}"
+            )
+        if self.agent_refusal_retries < 0:
+            raise ValueError("CODEX_AGENT_REFUSAL_RETRIES 不能小于 0")
 
 
 CONFIG = Config()

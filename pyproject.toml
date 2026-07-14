@@ -11,6 +11,7 @@ dependencies = [
     "mcp>=1.27.2",
     "pathspec>=1.1.1",
     "prompt-toolkit>=3.0.52",
+    "python-dotenv>=1.0.0",
     "pygments>=2.20.0",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
@@ -21,8 +22,8 @@ dependencies = [
 [project.scripts]
 codex = "src.codex.cli:main"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=7.0.0",
 ]
 

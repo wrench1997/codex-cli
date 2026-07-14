@@ -13,7 +13,6 @@ vLLM Prefix Caching 验证脚本 - TTFT 对比法（简化版）
 import os
 import time
 from dotenv import load_dotenv
-from openai import OpenAI
 
 # ================= 加载配置 =================
 load_dotenv()
@@ -23,8 +22,6 @@ model_name = os.getenv("MODEL_NAME", "Qwen/Qwen3.5-397B-A17B-FP8")
 
 if not base_url:
     raise ValueError("❌ 错误：未在 .env 中找到 VLLM_BASE_URL")
-
-client = OpenAI(base_url=base_url, api_key="NOT_NEEDED")
 
 # ================= 构造长文本 =================
 # 重复的段落，构造约 15000-20000 tokens 的长 prompt
@@ -39,7 +36,13 @@ messages = [
 
 # ================= TTFT 测量 =================
 def measure_ttft(msgs):
-    """流式测量首字延迟"""
+    """流式测量首字延迟。openai 仅在实际运行脚本时需要。"""
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("请先安装 openai：pip install openai") from exc
+
+    client = OpenAI(base_url=base_url, api_key="NOT_NEEDED")
     start = time.perf_counter()
     response = client.chat.completions.create(
         model=model_name,
