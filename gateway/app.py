@@ -28,12 +28,57 @@ class ContextLimitExceededError(Exception):
 # CONFIG
 # =========================================================
 
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://yourserver:7980")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3.5-397B-A17B-FP8")
-# vLLM Metrics 端点 URL（从基础 URL 派生）
-METRICS_URL = VLLM_BASE_URL.rstrip("/") + "/metrics"
-# 数据刷新频率（秒）
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_openai_api_base(value: str) -> str:
+    """Normalize either a server root or an OpenAI endpoint to a /v1 API base."""
+    base = (value or "").strip().rstrip("/")
+    for suffix in ("/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)].rstrip("/")
+            break
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return base
+
+
+# Backward-compatible names are kept, while the new UPSTREAM_* names allow the
+# same gateway to switch between a raw vLLM server and an OpenAI-compatible relay.
+UPSTREAM_KIND = os.getenv("UPSTREAM_KIND", "vllm").strip().lower()
+UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL") or os.getenv(
+    "VLLM_BASE_URL", "http://yourserver:7980"
+)
+UPSTREAM_API_BASE = _normalize_openai_api_base(UPSTREAM_BASE_URL)
+UPSTREAM_CHAT_URL = f"{UPSTREAM_API_BASE}/chat/completions"
+UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY") or os.getenv("VLLM_API_KEY", "")
+MODEL_NAME = os.getenv("UPSTREAM_MODEL") or os.getenv(
+    "MODEL_NAME", "Qwen/Qwen3.5-397B-A17B-FP8"
+)
+
+# Keep the old public variable for code/scripts that import it.
+VLLM_BASE_URL = UPSTREAM_BASE_URL
+
+_upstream_root = UPSTREAM_API_BASE[:-3] if UPSTREAM_API_BASE.endswith("/v1") else UPSTREAM_API_BASE
+METRICS_URL = os.getenv("UPSTREAM_METRICS_URL", _upstream_root.rstrip("/") + "/metrics")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+ENABLE_METRICS = _env_bool("GATEWAY_ENABLE_METRICS", UPSTREAM_KIND == "vllm")
+ENABLE_THINKING = _env_bool("GATEWAY_ENABLE_THINKING", UPSTREAM_KIND == "vllm")
+INCLUDE_STREAM_USAGE = _env_bool("GATEWAY_INCLUDE_STREAM_USAGE", UPSTREAM_KIND == "vllm")
+UPSTREAM_TIMEOUT_SECONDS = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "1800"))
+
+
+def _upstream_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if UPSTREAM_API_KEY:
+        headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+    return headers
+
+
 app = FastAPI()
 
 # =========================================================
@@ -130,8 +175,10 @@ class BillingStats:
         # 是否已初始化基准值
         self.metrics_baseline_initialized = False
         
-        # 启动后台线程定期刷新 metrics
-        self._start_metrics_polling()
+        # Raw vLLM exposes /metrics; most OpenAI relays do not. Avoid a noisy
+        # background polling loop unless explicitly enabled.
+        if ENABLE_METRICS:
+            self._start_metrics_polling()
     
     def _init_metrics_baseline(self, metrics_text):
         """初始化 metrics 基准值（启动时的累计值）"""
@@ -497,9 +544,13 @@ def convert_openai_messages(messages, tools=None):
         if role == "assistant" and msg.get("tool_calls"):
             xml_blocks = []
             for tc in msg["tool_calls"]:
-                fn = tc["function"]
-                args = json.loads(fn["arguments"])
-                xml_blocks.append(build_xml_tool_call(fn["name"], args))
+                fn = tc.get("function", {})
+                raw_args = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    args = {"raw_arguments": str(raw_args)}
+                xml_blocks.append(build_xml_tool_call(fn.get("name", ""), args))
             out.append({"role": "assistant", "content": "\n".join(xml_blocks)})
             continue
 
@@ -517,9 +568,24 @@ def convert_responses_input(input_items, tools=None):
     for item in input_items:
         item_type = item.get("type", "message")
         if item_type == "function_call_output":
+            # The upstream model is driven through a prompt/XML tool protocol,
+            # so do not send a Chat Completions `tool` message without a
+            # tool_call_id. Several vLLM/OpenAI-compatible servers reject it.
             messages.append({
-                "role": "tool",
-                "content": item.get("output", ""),
+                "role": "user",
+                "content": f"<tool_response>\n{item.get('output', '')}\n</tool_response>",
+            })
+            continue
+
+        if item_type == "function_call":
+            raw_args = item.get("arguments", "{}")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+            except (json.JSONDecodeError, TypeError, ValueError):
+                args = {"raw_arguments": str(raw_args)}
+            messages.append({
+                "role": "assistant",
+                "content": build_xml_tool_call(item.get("name", ""), args),
             })
             continue
 
@@ -554,18 +620,26 @@ def convert_responses_input(input_items, tools=None):
 
 async def vllm_stream(payload):
     """流式请求 vLLM，并测量 TTFT 用于缓存命中判断"""
-    # 添加 stream_options 以请求 vLLM 返回 usage 信息
+    # Raw vLLM supports stream_options.include_usage. Some relays reject this
+    # extension, so it is configurable and defaults off for relay mode.
     payload_with_usage = payload.copy()
-    payload_with_usage["stream_options"] = {"include_usage": True}
+    if INCLUDE_STREAM_USAGE:
+        payload_with_usage["stream_options"] = {"include_usage": True}
     
     start_time = time.perf_counter()
     ttft_measured = None
     first_token_received = False
     context_limit_detected = False  # 上下文超限标志
     
-    async with httpx.AsyncClient(timeout=None) as client:
+    timeout = None if UPSTREAM_TIMEOUT_SECONDS <= 0 else UPSTREAM_TIMEOUT_SECONDS
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
-            async with client.stream("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload_with_usage) as r:
+            async with client.stream(
+                "POST",
+                UPSTREAM_CHAT_URL,
+                json=payload_with_usage,
+                headers=_upstream_headers(),
+            ) as r:
                 # 检查 HTTP 状态码
                 if r.status_code != 200:
                     error_text = await r.aread()
@@ -647,6 +721,100 @@ async def vllm_stream(payload):
                 print(f"[Gateway] ❌ 请求异常：{e}")
                 raise
 
+
+
+def _copy_optional_request_fields(source: dict, target: dict) -> None:
+    """Forward common OpenAI-compatible generation fields when present."""
+    for key in (
+        "max_tokens",
+        "max_completion_tokens",
+        "top_p",
+        "stop",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "response_format",
+        "logprobs",
+        "top_logprobs",
+        "user",
+    ):
+        if key in source and source[key] is not None:
+            target[key] = source[key]
+
+
+def _build_upstream_payload(body: dict, messages: list[dict], stream: bool) -> dict:
+    requested_model = body.get("model")
+    model = MODEL_NAME if not requested_model or requested_model == "auto" else requested_model
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if body.get("temperature") is not None:
+        payload["temperature"] = body["temperature"]
+    elif UPSTREAM_KIND == "vllm":
+        payload["temperature"] = 0.2
+
+    _copy_optional_request_fields(body, payload)
+
+    # Qwen/vLLM private thinking fields are useful for the old path but are
+    # rejected by many OpenAI relays. They are now gated by configuration.
+    if ENABLE_THINKING:
+        enable_thinking = body.get("enable_thinking", body.get("thinking_enabled", True))
+        payload["enable_thinking"] = bool(enable_thinking)
+        payload["thinking_enabled"] = bool(enable_thinking)
+        payload["extra_body"] = {
+            "enable_thinking": bool(enable_thinking),
+            "thinking_enabled": bool(enable_thinking),
+        }
+
+    return payload
+
+# =========================================================
+# HEALTH / UPSTREAM PROBE
+# =========================================================
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "upstream_kind": UPSTREAM_KIND,
+        "upstream_api_base": UPSTREAM_API_BASE,
+        "model": MODEL_NAME,
+        "metrics_enabled": ENABLE_METRICS,
+        "thinking_enabled": ENABLE_THINKING,
+    }
+
+
+@app.get("/v1/gateway/probe")
+async def gateway_probe():
+    """Check the configured upstream without exposing its API key."""
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=min(UPSTREAM_TIMEOUT_SECONDS, 20)) as client:
+            response = await client.get(
+                f"{UPSTREAM_API_BASE}/models",
+                headers=_upstream_headers(),
+            )
+        return {
+            "reachable": True,
+            "status_code": response.status_code,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "upstream_api_base": UPSTREAM_API_BASE,
+            "body_preview": response.text[:500],
+        }
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "reachable": False,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                "upstream_api_base": UPSTREAM_API_BASE,
+                "error": str(exc),
+            },
+            status_code=502,
+        )
+
+
 # =========================================================
 # MODELS
 # =========================================================
@@ -666,37 +834,21 @@ async def models():
 async def responses(req: Request):
     body = await req.json()
     stream = body.get("stream", False)
-    model = body.get("model", MODEL_NAME)
     response_id = f"resp_{uuid.uuid4().hex[:8]}"
     tools = body.get("tools")
-    
+
     messages = convert_responses_input(body.get("input", []), tools)
-    
-    # Qwen3.5 开启思考模式的参数
-    extra_body = {
-        "enable_thinking": True,
-        "thinking_enabled": True,
-    }
-    # 传递用户请求中的 thinking 参数
-    if body.get("enable_thinking") is not None:
-        extra_body["enable_thinking"] = body.get("enable_thinking")
-    if body.get("thinking_enabled") is not None:
-        extra_body["thinking_enabled"] = body.get("thinking_enabled")
 
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-        "temperature": body.get("temperature", 0.2),
-        "extra_body": extra_body,
-        # 某些 vLLM 版本需要在顶层传递
-        "enable_thinking": True,
-        "thinking_enabled": True,
-    }
+    payload = _build_upstream_payload(body, messages, stream)
+    model = payload["model"]
 
-    # 调试：打印请求参数
-    print(f"[Gateway] 完整 payload extra_body: {extra_body}")
-    print(f"[Gateway] 顶层 enable_thinking: {payload.get('enable_thinking')}")
+    if _env_bool("GATEWAY_DEBUG_REQUESTS", False):
+        print(
+            "[Gateway] upstream=", UPSTREAM_CHAT_URL,
+            " kind=", UPSTREAM_KIND,
+            " model=", payload.get("model"),
+            " thinking=", payload.get("enable_thinking"),
+        )
     
     # =========================================================
     # 预判式压缩：在请求前检查是否可能超限
@@ -859,12 +1011,11 @@ async def _handle_stream_response(payload: dict, response_id: str, model: str):
             
             # 处理 reasoning_content：添加  标签
             if reasoning_piece:
-                piece += "" + reasoning_piece
-            
-            # 处理 content：如果之前有 reasoning，需要先关闭  标签
+                piece += "<think>" + reasoning_piece + "</think>"
+
+            # Content remains visible; reasoning is wrapped so get_emit_text
+            # removes it without leaking private/internal reasoning text.
             if content_piece:
-                if reasoning_piece:
-                    piece += ""
                 piece += content_piece
                 
             if piece:
@@ -889,9 +1040,17 @@ async def _handle_stream_response(payload: dict, response_id: str, model: str):
 
 async def _handle_non_stream_response(payload: dict, response_id: str, model: str):
     """处理非流式响应"""
-    async with httpx.AsyncClient(timeout=1800) as client:
-        r = await client.post(f"{VLLM_BASE_URL}/v1/chat/completions", json=payload)
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_SECONDS) as client:
+        r = await client.post(
+            UPSTREAM_CHAT_URL,
+            json=payload,
+            headers=_upstream_headers(),
+        )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Upstream HTTP {r.status_code}: {r.text[:1000]}")
     data = r.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(json.dumps(data["error"], ensure_ascii=False))
     
     # 统计 token 使用（非流式模式）
     usage = data.get("usage")
@@ -903,15 +1062,44 @@ async def _handle_non_stream_response(payload: dict, response_id: str, model: st
         if input_tokens > 0 or output_tokens > 0:
             billing_stats.add_request(input_tokens, output_tokens, ttft)
     
-    text = data["choices"][0]["message"].get("content", "")
-    tc = parse_xml_tool_call(text)
-    
-    if tc:
-        out_item = {"id": f"fc_{uuid.uuid4().hex[:8]}", "type": "function_call", "status": "completed", "call_id": tc["id"], "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
-    else:
-        out_item = {"id": f"msg_{uuid.uuid4().hex[:8]}", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": strip_think(text)}]}
-        
-    response = {"id": response_id, "object": "response", "created_at": int(time.time()), "status": "completed", "model": model, "output": [out_item]}
+    choices = data.get("choices") or []
+    raw_message = (choices[0].get("message") or {}) if choices else {}
+    text = _content_to_text(raw_message.get("content"))
+    output_items: list[dict[str, Any]] = []
+
+    native_calls = raw_message.get("tool_calls") or []
+    for raw_call in native_calls:
+        function = raw_call.get("function") or {}
+        output_items.append({
+            "id": f"fc_{uuid.uuid4().hex[:8]}",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": raw_call.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+            "name": function.get("name", ""),
+            "arguments": function.get("arguments", "{}"),
+        })
+
+    if not output_items:
+        tc = parse_xml_tool_call(text)
+        if tc:
+            output_items.append({
+                "id": f"fc_{uuid.uuid4().hex[:8]}",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tc["id"],
+                "name": tc["function"]["name"],
+                "arguments": tc["function"]["arguments"],
+            })
+        else:
+            output_items.append({
+                "id": f"msg_{uuid.uuid4().hex[:8]}",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": strip_think(text)}],
+            })
+
+    response = {"id": response_id, "object": "response", "created_at": int(time.time()), "status": "completed", "model": model, "output": output_items}
     RESPONSES[response_id] = response
     return JSONResponse(response)
 
@@ -920,9 +1108,156 @@ async def get_response(response_id: str):
     if response_id in RESPONSES: return RESPONSES[response_id]
     return {"id": response_id, "object": "response", "status": "completed", "output": []}
 
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+async def _chat_non_stream_response(body: dict, payload: dict, model: str):
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            UPSTREAM_CHAT_URL,
+            json=payload,
+            headers=_upstream_headers(),
+        )
+    if response.status_code >= 400:
+        return JSONResponse(
+            {"error": {"message": response.text[:1000], "type": "upstream_error"}},
+            status_code=response.status_code,
+        )
+
+    data = response.json()
+    if isinstance(data, dict) and data.get("error"):
+        return JSONResponse(data, status_code=502)
+
+    choices = data.get("choices") or []
+    raw_choice = choices[0] if choices else {}
+    raw_message = raw_choice.get("message") or {}
+    text = _content_to_text(raw_message.get("content"))
+    parsed_call = parse_xml_tool_call(text)
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": get_emit_text(text).strip() or None,
+    }
+    finish_reason = raw_choice.get("finish_reason") or "stop"
+
+    if raw_message.get("tool_calls"):
+        message["tool_calls"] = raw_message["tool_calls"]
+        finish_reason = "tool_calls"
+    elif parsed_call:
+        message["tool_calls"] = [parsed_call]
+        finish_reason = "tool_calls"
+
+    result = {
+        "id": data.get("id") or f"chatcmpl_{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": data.get("created") or int(time.time()),
+        "model": data.get("model") or model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+    }
+    if data.get("usage") is not None:
+        result["usage"] = data["usage"]
+    return JSONResponse(result)
+
+
+async def _chat_stream_response(payload: dict, model: str):
+    completion_id = f"chatcmpl_{uuid.uuid4().hex[:12]}"
+
+    async def events():
+        def emit(delta: dict, finish_reason=None, usage=None):
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            }
+            if usage is not None:
+                chunk["usage"] = usage
+            return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        yield emit({"role": "assistant"})
+        accumulated = ""
+        emitted_length = 0
+        native_tool_seen = False
+
+        async for chunk in vllm_stream(payload):
+            if chunk == "[DONE]":
+                parsed_call = None if native_tool_seen else parse_xml_tool_call(accumulated)
+                if parsed_call:
+                    yield emit({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": parsed_call["id"],
+                            "type": "function",
+                            "function": parsed_call["function"],
+                        }]
+                    })
+                    yield emit({}, "tool_calls")
+                else:
+                    yield emit({}, "tool_calls" if native_tool_seen else "stop")
+                yield "data: [DONE]\n\n"
+                return
+
+            usage = chunk.get("usage") if isinstance(chunk, dict) else None
+            choices = chunk.get("choices", []) if isinstance(chunk, dict) else []
+            if not choices:
+                if usage:
+                    yield emit({}, None, usage=usage)
+                continue
+
+            delta = choices[0].get("delta") or {}
+            tool_calls = delta.get("tool_calls") or []
+            if tool_calls:
+                native_tool_seen = True
+                yield emit({"tool_calls": tool_calls})
+
+            content_piece = _content_to_text(delta.get("content"))
+            reasoning_piece = _content_to_text(delta.get("reasoning_content"))
+            if reasoning_piece:
+                accumulated += f"<think>{reasoning_piece}</think>"
+            if content_piece:
+                accumulated += content_piece
+
+            visible = get_emit_text(accumulated)
+            new_text = visible[emitted_length:]
+            if new_text:
+                emitted_length = len(visible)
+                yield emit({"content": new_text})
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
-    return JSONResponse({"error": "Please use /v1/responses API for streaming Agent."})
+    """Backward-compatible Chat Completions endpoint.
+
+    It keeps the gateway's old prompt/XML tool mechanism, but exposes standard
+    Chat Completions responses so older Codex/OpenAI-compatible clients continue
+    to work after the upstream is switched between vLLM and a relay.
+    """
+    body = await req.json()
+    stream = bool(body.get("stream", False))
+    requested_model = body.get("model")
+    model = MODEL_NAME if not requested_model or requested_model == "auto" else requested_model
+    messages = convert_openai_messages(body.get("messages", []), body.get("tools"))
+    payload = _build_upstream_payload(body, messages, stream)
+
+    if stream:
+        return await _chat_stream_response(payload, model)
+    return await _chat_non_stream_response(body, payload, model)
 
 
 # =========================================================

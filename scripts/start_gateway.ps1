@@ -31,8 +31,15 @@ Write-Host ""
 
 # 打印关键环境变量
 Write-Host "[INFO] Environment Variables:" -ForegroundColor Yellow
-Write-Host "  VLLM_BASE_URL = $([Environment]::GetEnvironmentVariable('VLLM_BASE_URL', 'Process'))" -ForegroundColor Gray
-Write-Host "  MODEL_NAME    = $([Environment]::GetEnvironmentVariable('MODEL_NAME', 'Process'))" -ForegroundColor Gray
+$upstreamBase = [Environment]::GetEnvironmentVariable('UPSTREAM_BASE_URL', 'Process')
+if (-not $upstreamBase) { $upstreamBase = [Environment]::GetEnvironmentVariable('VLLM_BASE_URL', 'Process') }
+$upstreamModel = [Environment]::GetEnvironmentVariable('UPSTREAM_MODEL', 'Process')
+if (-not $upstreamModel) { $upstreamModel = [Environment]::GetEnvironmentVariable('MODEL_NAME', 'Process') }
+$upstreamKind = [Environment]::GetEnvironmentVariable('UPSTREAM_KIND', 'Process')
+if (-not $upstreamKind) { $upstreamKind = 'vllm' }
+Write-Host "  UPSTREAM_KIND = $upstreamKind" -ForegroundColor Gray
+Write-Host "  UPSTREAM_BASE = $upstreamBase" -ForegroundColor Gray
+Write-Host "  MODEL          = $upstreamModel" -ForegroundColor Gray
 Write-Host ""
 
 # 检查 Python 是否可用

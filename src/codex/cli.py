@@ -2864,6 +2864,9 @@ async def _process_message(
 @click.option("--api-mode", type=click.Choice(["auto", "responses", "chat", "gateway"], case_sensitive=False),
               default=None,
               help="接口模式：responses=Responses，chat=Chat Completions，gateway=旧网关，auto=自动识别")
+@click.option("--tool-transport", type=click.Choice(["native", "prompt", "hybrid"], case_sensitive=False),
+              default=None,
+              help="工具传输：native=原生函数调用，prompt=文本工具协议，hybrid=同时启用")
 @click.option("--no-agent", "no_agent", is_flag=True, default=False,
               help="纯聊天模式，不使用工具")
 @click.option("--temperature", "-t", default=None, type=float,
@@ -2876,7 +2879,7 @@ async def _process_message(
               help="虚拟文件系统模式：自动启动 RJCut Studio Electron 应用并连接 MCP 服务器，屏蔽本地文件操作工具")
 @click.option("--vfs-port", type=int, default=8001,
               help="VFS MCP 服务器端口（默认：8001）")
-def main(task, workdir, auto_approve, model, api, api_mode, no_agent, temperature, mcp, mcp_config, vfs_mode, vfs_port):
+def main(task, workdir, auto_approve, model, api, api_mode, tool_transport, no_agent, temperature, mcp, mcp_config, vfs_mode, vfs_port):
     """
     Codex Chat — 持续对话的 AI 编程助手
 
@@ -2890,6 +2893,8 @@ def main(task, workdir, auto_approve, model, api, api_mode, no_agent, temperatur
         CONFIG.api_base = api
     if api_mode:
         CONFIG.api_mode = api_mode.lower()
+    if tool_transport:
+        CONFIG.tool_transport = tool_transport.lower()
     if temperature is not None:
         CONFIG.temperature = temperature
 
