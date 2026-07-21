@@ -454,7 +454,8 @@ def _build_prompt_tool_instructions(tools: list[dict]) -> str:
         "3. Do not put commentary before or after the final tool call.",
         "4. After receiving <tool_response>, continue from the real result and call more mcodex tools when needed.",
         "5. If you previously said you had no access or permission, that was incorrect: retry with a mcodex tool immediately.",
-        "6. The legacy <tool_call><function=...><parameter=...> format is accepted, but the JSON format above is preferred.",
+        "6. Inside <mcodex_tool_call>, emit pure JSON only. Never write an <arguments> tag; use the JSON key ,\"arguments\": exactly.",
+        "7. The legacy <tool_call><function=...><parameter=...> format is accepted, but never mix it with mcodex JSON format.",
     ])
     return "\n".join(lines)
 
@@ -768,6 +769,39 @@ def _tool_call_from_json(payload: Any, index: int = 0) -> Optional[dict]:
     }
 
 
+def _decode_prompt_tool_payload(body: str) -> Any:
+    """解析文本工具调用 JSON，并修复模型偶发生成的 JSON/XML 混合格式。
+
+    某些模型会把正确的 `` ,"arguments": `` 错写成 ``<arguments>``，例如：
+    ``{"name":"read_file"<arguments>{"path":"a.py"}}``。
+    这不是合法 JSON，但语义明确，可以在本地安全地规范化后再解析。
+    """
+    candidate = (body or "").strip()
+    if not candidate:
+        return None
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+
+    repaired = re.sub(
+        r"\s*,?\s*<arguments>\s*:?\s*",
+        ',"arguments":',
+        candidate,
+        count=1,
+        flags=re.I,
+    )
+    repaired = re.sub(r"\s*</arguments>\s*", "", repaired, flags=re.I)
+    if repaired == candidate:
+        return None
+
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+
+
 def _parse_tool_calls(text: str) -> list[dict]:
     """解析 JSON/legacy XML 文本工具调用。"""
     calls: list[dict] = []
@@ -775,10 +809,7 @@ def _parse_tool_calls(text: str) -> list[dict]:
 
     # 推荐格式：<mcodex_tool_call>{"name":...,"arguments":...}</mcodex_tool_call>
     for index, match in enumerate(MCODEX_JSON_CALL_RE.finditer(source)):
-        try:
-            payload = json.loads(match.group("body"))
-        except json.JSONDecodeError:
-            continue
+        payload = _decode_prompt_tool_payload(match.group("body"))
         call = _tool_call_from_json(payload, index)
         if call:
             calls.append(call)

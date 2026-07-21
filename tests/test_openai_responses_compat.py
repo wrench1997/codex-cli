@@ -760,6 +760,38 @@ def test_prompt_json_tool_call_is_parsed():
     assert calls[0]["_mcodex_transport"] == "prompt"
 
 
+def test_prompt_hybrid_json_xml_arguments_is_repaired():
+    from src.codex.cli import _extract_function_call, _parse_tool_calls
+
+    calls = _parse_tool_calls(
+        '<mcodex_tool_call>{"name":"update_task_contract"<arguments>{"goal":"fix image","acceptance_items":["syntax ok"],"affected_files":["api_digital_human.py"]}}</mcodex_tool_call>'
+    )
+
+    assert len(calls) == 1
+    name, args, call_id = _extract_function_call(calls[0])
+    assert name == "update_task_contract"
+    assert args == {
+        "goal": "fix image",
+        "acceptance_items": ["syntax ok"],
+        "affected_files": ["api_digital_human.py"],
+    }
+    assert call_id
+    assert calls[0]["_mcodex_transport"] == "prompt"
+
+
+def test_prompt_hybrid_arguments_with_closing_tag_is_repaired():
+    from src.codex.cli import _extract_function_call, _parse_tool_calls
+
+    calls = _parse_tool_calls(
+        '<mcodex_tool_call>{"name":"read_file",<arguments>{"path":"api.py"}</arguments>}</mcodex_tool_call>'
+    )
+
+    assert len(calls) == 1
+    name, args, _call_id = _extract_function_call(calls[0])
+    assert name == "read_file"
+    assert args == {"path": "api.py"}
+
+
 def test_missing_tool_name_with_paths_is_repaired():
     from src.codex.cli import _extract_function_call, _repair_local_tool_call
 
