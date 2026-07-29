@@ -1,0 +1,4 @@
+interface:
+  display_name: "Long-Running Engineering"
+  short_description: "Resume-safe engineering workflow"
+  default_prompt: "Use $long-running-engineering to plan, execute, verify, checkpoint, and resume this engineering task."

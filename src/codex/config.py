@@ -86,6 +86,14 @@ class Config:
 
     max_context_tokens: int = field(default_factory=lambda: int(_env("CODEX_MAX_CONTEXT_TOKENS", "140000")))
     keep_recent_turns: int = field(default_factory=lambda: int(_env("CODEX_KEEP_RECENT_TURNS", "6")))
+    # 给模型输出、工具 schema 和协议包装预留空间；达到这个预算前就压缩。
+    context_reserve_tokens: int = field(default_factory=lambda: int(_env("CODEX_CONTEXT_RESERVE_TOKENS", "12000")))
+    # 所有工具结果进入模型前的硬上限。UI 和模型看到相同的安全摘要。
+    max_tool_output_chars: int = field(default_factory=lambda: int(_env("CODEX_MAX_TOOL_OUTPUT_CHARS", "24000")))
+    max_tool_output_lines: int = field(default_factory=lambda: int(_env("CODEX_MAX_TOOL_OUTPUT_LINES", "500")))
+    # read_file 默认分页，模型可用 start_line/end_line 继续读取后续内容。
+    max_read_file_lines: int = field(default_factory=lambda: int(_env("CODEX_MAX_READ_FILE_LINES", "400")))
+    tool_retry_budget: int = field(default_factory=lambda: int(_env("CODEX_TOOL_RETRY_BUDGET", "3")))
 
     def __post_init__(self):
         aliases = {
@@ -116,6 +124,13 @@ class Config:
                 "CODEX_TOOL_TRANSPORT 必须是 native、prompt 或 hybrid，"
                 f"当前值：{self.tool_transport!r}"
             )
+        for name in (
+            "max_context_tokens", "context_reserve_tokens", "max_tool_output_chars",
+            "max_tool_output_lines", "max_read_file_lines",
+            "tool_retry_budget",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} 必须是正整数")
         if self.tool_choice not in {"auto", "required", "none"}:
             raise ValueError(
                 "CODEX_TOOL_CHOICE 必须是 auto、required 或 none，"

@@ -1,6 +1,8 @@
 param(
     [string]$BaseUrl = "http://112.111.7.91:7980/v1",
     [string]$Model = "Qwen/Qwen3.5-397B-A17B-FP8",
+    [ValidateSet("native", "prompt", "hybrid")]
+    [string]$ToolTransport = "native",
     [Parameter(ValueFromRemainingArguments=$true)]
     [string[]]$Arguments
 )
@@ -11,7 +13,7 @@ $env:CODEX_API_BASE = $BaseUrl
 $env:CODEX_API_MODE = "chat"
 $env:CODEX_API_KEY = "dummy"
 $env:CODEX_MODEL = $Model
-$env:CODEX_TOOL_TRANSPORT = "prompt"
+$env:CODEX_TOOL_TRANSPORT = $ToolTransport
 $env:CODEX_SEND_TEMPERATURE = "true"
 
 & (Join-Path $PSScriptRoot "mcodex.ps1") @Arguments

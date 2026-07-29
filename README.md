@@ -360,14 +360,31 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8080
 | `CODEX_TEMPERATURE` | `0.6` | 采样温度 |
 | `CODEX_MAX_TURNS` | `50` | 最大工具调用轮次 |
 | `CODEX_AUTO_APPROVE` | `false` | 自动审批 |
-| `CODEX_MAX_CONTEXT_TOKENS` | `140000` | 触发上下文压缩的 token 阈值 |
+| `CODEX_MAX_CONTEXT_TOKENS` | `140000` | 模型上下文窗口的估算上限；请求前会扣除输出预留空间 |
+| `CODEX_CONTEXT_RESERVE_TOKENS` | `12000` | 为模型生成回复、工具 schema 与协议包装预留的 token 数 |
 | `CODEX_KEEP_RECENT_TURNS` | `6` | 上下文压缩时保留的最近对话轮数 |
+| `CODEX_MAX_READ_FILE_LINES` | `400` | `read_file` 单次最多返回行数；使用 `start_line` 分页继续读取 |
+| `CODEX_MAX_TOOL_OUTPUT_CHARS` | `24000` | 任意本地/MCP 工具返回给模型前的字符上限，超出时保留首尾 |
+| `CODEX_MAX_TOOL_OUTPUT_LINES` | `500` | 任意本地/MCP 工具返回给模型前的行数上限 |
+| `CODEX_TOOL_RETRY_BUDGET` | `3` | 同一工具与参数连续失败后的最大执行次数，超过后任务标记为阻塞 |
 | `CODEX_PROJECT_DIR` | (自动检测) | 项目根目录（mcodex.ps1 使用） |
 | `CODEX_ENV_OVERRIDE` | `true` | `.env` 是否覆盖当前 Windows 会话变量 |
 | `CODEX_ENV_FILE` | (空) | 显式指定额外 `.env` 文件 |
 | `CODEX_AGENT_REFUSAL_RETRIES` | `2` | 模型错误声称无本地权限时的自动纠正次数 |
 | `VLLM_BASE_URL` | `http://yourserver:7980` | vLLM 地址（网关用） |
 | `POLL_INTERVAL` | `5` | Metrics 刷新间隔（秒） |
+
+## 长期工程任务
+
+Agent 会在工作目录创建 `.mcodex/`，其中保存活动任务、工具证据和检查点；该目录不包含源码修改，可以加入本地忽略规则。重启后输入 `/resume` 恢复任务，`/checkpoint [说明]` 会记录当前任务状态、Git HEAD 和工作区状态，`/recall <关键词>` 可检索之前完整的工具输出与测试证据。
+
+使用 `/handoff` 可生成 `.mcodex/handoff.md`，其中包括目标、验收证据、修改文件、下一步、最新 Git 检查点和最近工具证据。任务完成后使用 `/task done` 归档；未完成但需要停止时使用 `/task cancel`，两者都会保留交接报告和归档记录。
+
+使用 `python scripts/run_agent_evaluation.py --list` 查看 Agent 评测场景；`--scenario <名称>` 运行单场景，`--all --output report.json` 生成完整能力报告。评测覆盖单文件修复、多文件重构、失败恢复、长输出定位和恢复交接。
+
+需要隔离实验性工作时，可显式运行 `/worktree <名称>`；它会在当前仓库相邻目录创建一个 `codex/<名称>` 分支的 Git worktree，默认不会创建分支或切换目录。
+
+验收项必须通过 `complete_acceptance_item` 工具附带证据后才会完成；`verify_task` 只记录验证是否通过，不再自动批准所有验收项。
 
 ## 启动脚本
 

@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import traceback
+import asyncio
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,12 +20,12 @@ from src.codex.file_editor import (
     delete_lines,
     insert_lines,
     list_directory,
-    read_file,
     replace_lines,
     search_in_files,
     search_replace,
     write_file,
 )
+from src.codex.config import CONFIG
 
 # 可选的 SSH 远程模块
 try:
@@ -123,14 +125,30 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "complete_acceptance_item",
+            "description": "仅在有真实工具输出、测试结果或可复查证据时，标记一条验收项完成。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "验收项序号（从 1 开始）"},
+                    "evidence": {"type": "string", "description": "可复查的完成证据，例如测试命令和结果"},
+                },
+                "required": ["index", "evidence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
-            "description": "读取文件内容，支持显示行号。",
+            "description": "读取文件内容，支持显示行号。默认分页读取，内容较长时请用 start_line/end_line 继续读取。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径"},
                     "start_line": {"type": "integer", "description": "起始行（1-based，可选）"},
                     "end_line": {"type": "integer", "description": "结束行（1-based，可选）"},
+                    "max_lines": {"type": "integer", "description": "本次最多读取行数（可选；受安全上限限制）"},
                 },
                 "required": ["path"],
             },
@@ -520,6 +538,7 @@ class ToolExecutor:
         self.mcp_manager = mcp_manager  # 注入 MCP 管理器
         self.vfs_mode = vfs_mode  # 虚拟文件系统模式
         self._pending_writes: dict[str, str] = {}   # path -> diff (等待审批)
+        self.last_raw_output = ""
 
     def _resolve(self, path: str) -> str:
         """将相对路径解析为工作目录下的绝对路径。"""
@@ -527,7 +546,51 @@ class ToolExecutor:
             return path
         return os.path.join(self.workdir, path)
 
-    async def execute(self, name: str, args: dict[str, Any]) -> tuple[bool, str]:
+    @staticmethod
+    def _truncate_output(name: str, output: Any) -> str:
+        """限制所有工具结果，避免单次工具调用耗尽模型上下文。
+
+        保留开头和结尾，通常同时保住错误原因、摘要与最终测试结果。
+        """
+        text = output if isinstance(output, str) else str(output)
+        max_chars = CONFIG.max_tool_output_chars
+        max_lines = CONFIG.max_tool_output_lines
+        lines = text.splitlines(keepends=True)
+        original_chars = len(text)
+        original_lines = len(lines)
+
+        if original_chars <= max_chars and original_lines <= max_lines:
+            return text
+
+        if original_lines > max_lines:
+            marker = (
+                f"… [mcodex 已截断 {name} 输出：原 {original_lines} 行 / {original_chars} 字符；"
+                "请缩小范围、分页读取，或用搜索定位] …\n"
+            )
+            content_lines = max(1, max_lines - 1)
+            head_lines = max(1, int(content_lines * 0.6))
+            tail_lines = max(0, content_lines - head_lines)
+            text = "".join(lines[:head_lines]) + marker + (
+                "".join(lines[-tail_lines:]) if tail_lines else ""
+            )
+
+        if len(text) > max_chars:
+            marker = (
+                f"\n… [mcodex 已截断 {name} 输出：原 {original_lines} 行 / {original_chars} 字符；"
+                "请缩小范围、分页读取，或用搜索定位] …\n"
+            )
+            available = max(0, max_chars - len(marker))
+            head_chars = int(available * 0.6)
+            tail_chars = available - head_chars
+            if available:
+                text = text[:head_chars] + marker + (text[-tail_chars:] if tail_chars else "")
+            else:
+                text = marker[:max_chars]
+        return text
+
+    async def execute(
+        self, name: str, args: dict[str, Any], cancel_event: Any = None
+    ) -> tuple[bool, str]:
         """分发工具调用，返回 (success, output)。"""
         try:
             # VFS 模式：屏蔽本地文件操作工具，只允许通过 MCP 调用虚拟文件系统
@@ -543,16 +606,23 @@ class ToolExecutor:
                     vfs_tool_name = f"vfs_{name}"
                     if self.mcp_manager and any(t["function"]["name"] == vfs_tool_name for t in self.mcp_manager.get_all_tools()):
                         output = await self.mcp_manager.call_tool(vfs_tool_name, args)
-                        return True, output
+                        self.last_raw_output = str(output)
+                        return True, self._truncate_output(vfs_tool_name, output)
                     # 如果没有对应的 VFS 工具，返回错误提示
                     return False, f"❌ VFS 模式：本地工具 '{name}' 已被禁用，请使用 MCP 虚拟文件系统工具"
 
             # 如果匹配到 MCP 工具，交给 MCP 执行
             if self.mcp_manager and any(t["function"]["name"] == name for t in self.mcp_manager.get_all_tools()):
+                if cancel_event and cancel_event.is_set():
+                    raise asyncio.CancelledError("用户取消了工具调用")
                 output = await self.mcp_manager.call_tool(name, args)
-                return True, output
+                self.last_raw_output = str(output)
+                return True, self._truncate_output(name, output)
 
-            return self._dispatch(name, args)
+            # 本地文件/命令工具可能阻塞；放到线程中，以便主事件循环继续接收 Esc。
+            success, output = await asyncio.to_thread(self._dispatch, name, args, cancel_event)
+            self.last_raw_output = str(output)
+            return success, self._truncate_output(name, output)
         except FileNotFoundError as e:
             return False, f"❌ 文件未找到: {e}"
         except ValueError as e:
@@ -917,7 +987,7 @@ class ToolExecutor:
         except Exception as e:
             return False, f"❌ 写入 task.json 失败：{e}"
 
-    def _dispatch(self, name: str, args: dict) -> tuple[bool, str]:
+    def _dispatch(self, name: str, args: dict, cancel_event: Any = None) -> tuple[bool, str]:
         # ── verify_task ─────────────────────────────────
         if name == "verify_task":
             acceptance_items = args.get("acceptance_items", [])
@@ -991,25 +1061,54 @@ class ToolExecutor:
             except Exception as e:
                 return False, f"❌ NCM 解密失败：{e}"
 
+        # ── complete_acceptance_item ───────────────────
+        if name == "complete_acceptance_item":
+            index = int(args.get("index", 0))
+            evidence = str(args.get("evidence", "")).strip()
+            if index < 1 or not evidence:
+                return False, "❌ 必须提供有效的验收项序号和可复查证据"
+            return True, f"✅ 验收项 [{index}] 已记录证据：{evidence}"
+
         # ── read_file ──────────────────────────────────
         if name == "read_file":
             path = self._resolve(args["path"])
-            content = read_file(path)
-            lines = content.splitlines()
             start_line = args.get("start_line", 1)
-            end_line = args.get("end_line", len(lines))
             # 兼容字符串类型的行号（从 JSON 传递时可能是字符串）
             if isinstance(start_line, str):
                 start_line = int(start_line)
-            if isinstance(end_line, str):
-                end_line = int(end_line)
-            start = start_line - 1
-            end = end_line
-            slice_lines = lines[start:end]
-            numbered = "\n".join(
-                f"{start + i + 1:4d} │ {l}" for i, l in enumerate(slice_lines)
+            if start_line < 1:
+                raise ValueError("start_line 必须大于等于 1")
+            requested_end = args.get("end_line")
+            if isinstance(requested_end, str):
+                requested_end = int(requested_end)
+            requested_max = args.get("max_lines", CONFIG.max_read_file_lines)
+            if isinstance(requested_max, str):
+                requested_max = int(requested_max)
+            max_lines = min(max(1, requested_max), CONFIG.max_read_file_lines)
+            end_line = min(
+                requested_end if requested_end is not None else start_line + max_lines - 1,
+                start_line + max_lines - 1,
             )
-            return True, f"📄 {args['path']} ({len(lines)} 行)\n\n{numbered}"
+
+            # 只保留请求的行，避免大文件先整体读入内存再塞进模型上下文。
+            slice_lines: list[str] = []
+            total_lines = 0
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for total_lines, line in enumerate(handle, start=1):
+                    if start_line <= total_lines <= end_line:
+                        slice_lines.append(line.rstrip("\r\n"))
+            numbered = "\n".join(
+                f"{start_line + i:4d} │ {l}" for i, l in enumerate(slice_lines)
+            )
+            has_more = total_lines > end_line
+            next_hint = (
+                f"\n\n… 已分页。继续读取：start_line={end_line + 1}"
+                if has_more else ""
+            )
+            return True, (
+                f"📄 {args['path']}（共 {total_lines} 行；显示 {start_line}-{min(end_line, total_lines)} 行）\n\n"
+                f"{numbered}{next_hint}"
+            )
 
         # ── write_file ─────────────────────────────────
         elif name == "write_file":
@@ -1187,7 +1286,31 @@ class ToolExecutor:
                     cwd=workdir,
                     creationflags=creationflags,
                 )
-                stdout, stderr = proc.communicate(timeout=timeout)
+                deadline = time.monotonic() + timeout
+                # 短超时轮询，使 Esc 能中断下载、测试等长时间命令。
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        if os.name == "nt":
+                            subprocess.run(
+                                f"taskkill /F /T /PID {proc.pid}", shell=True,
+                                capture_output=True, timeout=5,
+                            )
+                        else:
+                            proc.kill()
+                        try:
+                            stdout, stderr = proc.communicate(timeout=1)
+                        except Exception:
+                            stdout, stderr = "", ""
+                        return False, "__CANCELLED__\n命令已被用户取消。\n" + (
+                            f"部分输出:\nSTDOUT:\n{stdout or ''}\nSTDERR:\n{stderr or ''}"
+                        )
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    try:
+                        stdout, stderr = proc.communicate(timeout=0.2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
                 result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
             except subprocess.TimeoutExpired as e:
                 # Windows 下需要显式终止整个进程树

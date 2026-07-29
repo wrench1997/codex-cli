@@ -53,6 +53,7 @@ from src.codex.config import CONFIG, LOADED_ENV_FILES
 from src.codex.file_editor import list_directory, read_file
 from src.codex.tools import TOOLS, ToolExecutor
 from src.codex.mcp.manager import McpManager
+from src.codex.workspace_state import WorkspaceState
 
 
 # ──────────────────────────────────────────────
@@ -70,6 +71,7 @@ class TaskState:
         self.verification_passed = False       # 验证是否通过
         self.status = "idle"                   # idle / implementing / verifying / done
         self.completed_items: set[int] = set() # 已完成的验收项索引（用于跟踪哪些验收项已完成）
+        self.block_reason = ""
 
     def mark_modified(self, files: list[str]):
         """标记代码已被修改"""
@@ -77,22 +79,35 @@ class TaskState:
         self.changed_files.update(files)
         self.status = "implementing"
         self.verification_passed = False
+        self.block_reason = ""
 
     def set_acceptance_items(self, items: list[str]):
         """设置验收项"""
-        self.acceptance_items = items
+        normalized = [str(item).strip() for item in items if str(item).strip()]
+        if normalized:
+            self.acceptance_items = normalized
+            self.completed_items = {i for i in self.completed_items if i <= len(normalized)}
+            self.status = "implementing"
+
+    def ensure_acceptance_items(self, items: list[str]) -> None:
+        """在模型遗漏任务契约时，从验证请求恢复验收项。"""
+        if not self.acceptance_items:
+            self.set_acceptance_items(items)
 
     def mark_verified(self, passed: bool):
         """标记验证结果"""
         self.verification_passed = passed
-        if passed:
-            self.status = "done"
-        else:
-            self.status = "verifying"
+        self.status = "done" if passed and self.are_all_items_completed() else "verifying"
 
     def mark_item_completed(self, item_index: int):
         """标记某个验收项已完成（索引从 1 开始）"""
         self.completed_items.add(item_index)
+        if self.verification_passed and self.are_all_items_completed():
+            self.status = "done"
+
+    def mark_blocked(self, reason: str):
+        self.status = "blocked"
+        self.block_reason = reason
 
     def are_all_items_completed(self) -> bool:
         """检查所有验收项是否都已完成"""
@@ -131,6 +146,35 @@ class TaskState:
         self.verification_passed = False
         self.status = "idle"
         self.completed_items = set()
+        self.block_reason = ""
+
+
+def _normalize_acceptance_items(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value) if value.lstrip().startswith("[") else [value]
+        except json.JSONDecodeError:
+            value = [value]
+    if not isinstance(value, list):
+        value = [value] if value is not None else []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _classify_tool_failure(output: str) -> str:
+    text = (output or "").lower()
+    if "timeout" in text or "超时" in text:
+        return "timeout"
+    if "context" in text or "上下文" in text or "token" in text:
+        return "context_limit"
+    if "permission" in text or "权限" in text or "拒绝" in text:
+        return "permission"
+    if "not found" in text or "未找到" in text or "不存在" in text:
+        return "not_found"
+    if "connection" in text or "network" in text or "连接" in text:
+        return "network"
+    if "exit=" in text or "failed" in text or "失败" in text:
+        return "command_failed"
+    return "unknown"
 
 
 
@@ -1040,6 +1084,13 @@ HELP_TEXT = """
 | `/billing`      | 显示当天计费统计 |
 | `/memory`       | 查看当前提炼的核心记忆点 |
 | `/compress`     | 手动压缩并归纳历史上下文 |
+| `/tasks`        | 查看当前持久化工程任务 |
+| `/checkpoint [label]` | 保存任务、Git 状态与下一步检查点 |
+| `/resume`       | 从 `.mcodex/active-task.json` 恢复任务上下文 |
+| `/recall <关键词>` | 检索本地保存的工具输出和验证证据 |
+| `/handoff`      | 生成可交接的任务报告到 `.mcodex/handoff.md` |
+| `/task done|cancel` | 完成归档或取消当前持久化任务 |
+| `/worktree <名称>` | 创建可选的隔离 Git worktree（不会自动执行） |
 | `/exit`         | 退出 |
 
 ## 命令行参数
@@ -1389,7 +1440,7 @@ class ChatAgent:
             f"8. When encountering a repeated error, call `update_lessons` to record the root cause and regression rule.\n\n"
             f"## 验收项执行纪律（最重要）:\n"
             f"- 接到任务后， FIRST thing: 调用 `update_task_contract` 明确所有验收项\n"
-            f"- 实现过程中，逐项勾验：每完成一个验收项，在回复中明确标注 '✅ 验收项 [N] 已完成'\n"
+            f"- 实现过程中，逐项勾验：每完成一个验收项，调用 `complete_acceptance_item` 并写入可复查证据\n"
             f"- 任务结束前，必须逐项核对：列出每个验收项的完成证据（测试结果、截图、日志等）\n"
             f"- 严禁遗漏：如果任务有 10 个验收项，必须完成 10 个，少一个都不行\n"
             f"- 严禁偷工减料：不得以'最小改动'为借口跳过边缘情况、异常处理或测试\n"
@@ -1402,18 +1453,23 @@ class ChatAgent:
             f"4. ✅ 在回复中明确列出：修改文件、验证命令及结果、剩余风险\n"
         ]
 
-        # 读取 agent/skills.md 作为额外的技能提示词（如果存在）
-        skills_path = os.path.join(workdir, "agent", "skills.md")
-        if os.path.exists(skills_path):
+        # 加载短小的仓库级规则；专项 SKILL.md 由 AGENTS.md 按需指引读取，
+        # 避免每轮都把所有工作流塞入上下文。
+        instruction_paths = [
+            os.path.join(workdir, "AGENTS.md"),
+            os.path.join(workdir, "agent", "skills.md"),  # 兼容旧项目布局
+        ]
+        for skills_path in instruction_paths:
+            if not os.path.exists(skills_path):
+                continue
             try:
                 with open(skills_path, "r", encoding="utf-8") as f:
                     skills_content = f.read()
                 if skills_content.strip():
                     system_content_parts.append(
-                        f"\n\n## Additional Skills and Instructions\n\n{skills_content}"
+                        f"\n\n## Repository Instructions ({os.path.basename(skills_path)})\n\n{skills_content}"
                     )
             except Exception:
-                # 如果读取失败，静默忽略
                 pass
 
         self._system_content = "".join(system_content_parts)
@@ -1432,6 +1488,14 @@ class ChatAgent:
 
         # 任务状态跟踪（防止未验证就宣称完成）
         self.task_state = TaskState()
+        self.task_goal = ""
+        self.task_next_steps: list[str] = []
+        self.acceptance_evidence: dict[str, str] = {}
+        self.failure_events: list[dict[str, str]] = []
+        self._tool_failure_attempts: dict[str, int] = {}
+        self.restore_drift = ""
+        self.workspace_state = WorkspaceState(workdir)
+        self._restore_workspace_task()
 
     # ── 历史管理 ──────────────────────────────────────────
 
@@ -1441,24 +1505,96 @@ class ChatAgent:
         self.turn_count = 0
         self.tool_call_count = 0
         self.task_state.reset()
+        self.task_goal = ""
+        self.task_next_steps = []
+        self.acceptance_evidence = {}
+        self.failure_events = []
+        self._tool_failure_attempts = {}
+        self.restore_drift = ""
+
+    def _task_snapshot(self) -> dict[str, Any]:
+        return {
+            "goal": self.task_goal,
+            "status": self.task_state.status,
+            "acceptance_items": self.task_state.acceptance_items,
+            "completed_items": sorted(self.task_state.completed_items),
+            "changed_files": sorted(self.task_state.changed_files),
+            "verification_passed": self.task_state.verification_passed,
+            "block_reason": self.task_state.block_reason,
+            "acceptance_evidence": self.acceptance_evidence,
+            "failure_events": self.failure_events[-20:],
+            "restore_drift": self.restore_drift,
+            "checkpoint_count": self.workspace_state.checkpoint_count(),
+            "memory_summary": self.memory_summary[-8000:],
+            "next_steps": self.task_next_steps,
+        }
+
+    def _persist_workspace_task(self) -> None:
+        if self.task_goal or self.task_state.dirty or self.task_state.acceptance_items:
+            self.workspace_state.save_task(self._task_snapshot())
+
+    def can_archive_task(self) -> bool:
+        if not self.task_state.can_finish():
+            return False
+        return all(
+            str(index) in self.acceptance_evidence and self.acceptance_evidence[str(index)].strip()
+            for index in range(1, len(self.task_state.acceptance_items) + 1)
+        )
+
+    def _restore_workspace_task(self) -> None:
+        task = self.workspace_state.load_task()
+        if not task or task.get("status") in {"done", "completed", "cancelled"}:
+            return
+        self.task_goal = str(task.get("goal", ""))
+        self.task_state.status = str(task.get("status", "idle"))
+        self.task_state.acceptance_items = list(task.get("acceptance_items", []))
+        self.task_state.completed_items = {int(i) for i in task.get("completed_items", [])}
+        self.task_state.changed_files = set(task.get("changed_files", []))
+        self.task_state.dirty = bool(self.task_state.changed_files)
+        self.task_state.verification_passed = bool(task.get("verification_passed", False))
+        self.task_state.block_reason = str(task.get("block_reason", ""))
+        self.acceptance_evidence = dict(task.get("acceptance_evidence", {}))
+        self.failure_events = list(task.get("failure_events", []))
+        self.memory_summary = str(task.get("memory_summary", ""))
+        self.task_next_steps = list(task.get("next_steps", []))
+        self.restore_drift = self.workspace_state.detect_git_drift()
+        restored = (
+            "【恢复的工程任务】\n"
+            f"目标：{self.task_goal or '未记录'}\n"
+            f"状态：{self.task_state.status}\n"
+            f"已改文件：{', '.join(sorted(self.task_state.changed_files)) or '无'}\n"
+            f"待办：{'；'.join(self.task_next_steps) or '请先检查任务账本与仓库状态'}\n"
+            f"记忆：{self.memory_summary[:1500] or '无'}\n"
+            + (f"Git 漂移：{self.restore_drift}\n" if self.restore_drift else "")
+            + "精确的旧工具输出可通过 /recall <关键词> 检索本地观察库。"
+        )
+        self.input_items.append({"type": "message", "role": "system", "content": restored})
 
     def add_user(self, text: str):
+        # 用户不应依赖模型“记得”先建任务；第一条实际需求自动成为可恢复的计划任务。
+        if (
+            self.agent_mode
+            and not self.task_goal
+            and text.strip()
+            and not text.lstrip().startswith(("/", "【mcodex Agent"))
+        ):
+            self.task_goal = text.strip()[:2000]
+            self.task_state.status = "planning"
+            self.task_next_steps = ["确认范围和验收项"]
         self.input_items.append({
             "type": "message",
             "role": "user",
             "content": text,
         })
+        self._persist_workspace_task()
 
     def add_assistant(self, text: str):
-        # 自动从 AI 回复中解析已完成的验收项标记
-        if self.task_state.acceptance_items:
-            self.task_state.parse_completed_items_from_text(text)
-        
         self.input_items.append({
             "type": "message",
             "role": "assistant",
             "content": text,
         })
+        self._persist_workspace_task()
 
     def add_tool_result(self, call_id: Optional[str], output: str):
         self.input_items.append({
@@ -1606,9 +1742,18 @@ class ChatAgent:
         )
         return total_chars // 2
 
+    def estimate_request_tokens(self) -> int:
+        """估算实际请求的 token 预算，包含工具定义和协议包装。"""
+        mode = self._resolved_api_mode or (
+            self.api_mode if self.api_mode != "auto" else "responses"
+        )
+        payload = self._build_responses_payload(mode, stream=False)
+        # 中文、JSON 和代码混合场景下按两字符一个 token 估算，宁可提前压缩。
+        return len(json.dumps(payload, ensure_ascii=False, default=str)) // 2
+
     # ── 记忆与上下文压缩 ──────────────────────────────────────
 
-    async def _generate_summary(self, old_messages_text: str) -> str:
+    async def _generate_summary(self, old_messages_text: str) -> Optional[str]:
         """调用大模型，生成结构化记忆总结。"""
         prompt = f"""你是一个 AI 架构师的记忆管理模块。请总结以下历史对话记录，提取对后续编程任务有用的核心信息。
 要求尽可能简练，保留关键的文件路径、函数名、已经验证的结论和当前的报错信息。
@@ -1656,7 +1801,7 @@ class ChatAgent:
                         and resp.status_code in {400, 404, 405, 415, 422, 500, 501}
                     ):
                         continue
-                    return f"（压缩上下文失败，错误：{last_error}）"
+                    return None
 
                 data = resp.json()
                 if mode == "chat":
@@ -1673,15 +1818,32 @@ class ChatAgent:
                     continue
                 break
 
-        return f"（压缩上下文失败，错误：{last_error}）"
+        return None
 
-    async def compress_context(self):
-        """执行上下文压缩"""
+    def _local_compaction_fallback(self, old_messages: list[dict]) -> str:
+        """摘要 API 不可用时保留可读的本地检查点，而不是继续携带超长历史。"""
+        facts: list[str] = []
+        for item in old_messages:
+            role = item.get("role", item.get("type", "unknown"))
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(item.get("content", "")).strip()
+            if content:
+                facts.append(f"[{role}] {content[:500]}")
+        excerpt = "\n".join(facts[-12:])[-6000:]
+        return (
+            "【本地压缩检查点】摘要请求失败，已移除旧的超长工具输出。"
+            "以下仅保留最近任务意图；需要精确文件内容、命令输出或 diff 时请重新读取/执行。\n"
+            + (excerpt or "（旧历史主要由工具输出构成，已安全移除）")
+        )
+
+    async def compress_context(self) -> bool:
+        """执行上下文压缩；失败时以本地检查点降级，保证上下文确实缩小。"""
         # 1. 至少要有一定数量的消息才进行压缩
         # 系统提示 (1) + 历史记忆 (1, 可选) + 要压缩的旧消息 + 保留的新消息
         keep_items = CONFIG.keep_recent_turns * 2  # 一轮对话通常包含一问一答，甚至包含工具结果
         if len(self.input_items) <= keep_items + 2:
-            return
+            return False
 
         # 2. 分离消息
         system_msg = self.input_items[0]
@@ -1705,6 +1867,8 @@ class ChatAgent:
 
         # 3. 调用模型生成新的总结
         new_summary = await self._generate_summary(history_text)
+        if not new_summary:
+            new_summary = self._local_compaction_fallback(old_msgs)
 
         # 4. 如果之前已经有记忆了，把旧记忆合并到新记忆的开头（滚动迭代）
         if self.memory_summary:
@@ -1720,6 +1884,7 @@ class ChatAgent:
         }
 
         self.input_items = [system_msg, memory_msg] + recent_msgs
+        return True
 
     # ── HTTP 流式调用 ──────────────────────────────────────
 
@@ -1794,9 +1959,33 @@ class ChatAgent:
                                 if on_token:
                                     await on_token(text)
                         else:
-                            async for line in resp.aiter_lines():
+                            line_iterator = resp.aiter_lines()
+                            line_task: Optional[asyncio.Task] = None
+                            while True:
                                 if cancel_event and cancel_event.is_set():
+                                    # 不在 wait_for() 的取消清理路径中等待远端关闭；
+                                    # 某些反向代理会一直挂起该读取。让 HTTP 客户端在退出
+                                    # 上下文时回收连接，同时立即把控制权还给 Esc。
+                                    network_stream = resp.extensions.get("network_stream")
+                                    if network_stream is not None:
+                                        close = getattr(network_stream, "aclose", None)
+                                        if close is not None:
+                                            await close()
+                                    if line_task and not line_task.done():
+                                        line_task.cancel()
                                     raise asyncio.CancelledError("用户取消了生成")
+                                if line_task is None:
+                                    line_task = asyncio.create_task(line_iterator.__anext__())
+                                done, _pending = await asyncio.wait({line_task}, timeout=0.2)
+                                if not done:
+                                    # 服务暂时不发 token 时也能响应 Esc。
+                                    continue
+                                try:
+                                    line = line_task.result()
+                                except StopAsyncIteration:
+                                    break
+                                finally:
+                                    line_task = None
 
                                 if not line or not line.startswith("data:"):
                                     continue
@@ -2017,11 +2206,23 @@ class ChatAgent:
         关键增强：修改代码后必须验证才能结束任务
         """
         # ==== 新增：在每轮开始前检查是否需要压缩上下文 ====
-        current_tokens = self.estimate_tokens()
-        if current_tokens > CONFIG.max_context_tokens:
-            console.print(f"\n[bold yellow]⚠️ 当前上下文达到 {current_tokens:,} tokens，正在进行记忆压缩与归纳...[/bold yellow]")
-            await self.compress_context()
-            console.print("[bold green]✅ 记忆压缩完成，已释放多余上下文！[/bold green]\n")
+        current_tokens = self.estimate_request_tokens()
+        input_budget = max(1, CONFIG.max_context_tokens - CONFIG.context_reserve_tokens)
+        if current_tokens > input_budget:
+            console.print(
+                f"\n[bold yellow]⚠️ 预计请求上下文 {current_tokens:,} tokens，"
+                f"超过安全预算 {input_budget:,}，正在压缩历史...[/bold yellow]"
+            )
+            compacted = await self.compress_context()
+            compressed_tokens = self.estimate_request_tokens()
+            if compacted:
+                console.print(
+                    f"[bold green]✅ 上下文已压缩：{current_tokens:,} → {compressed_tokens:,} tokens。[/bold green]\n"
+                )
+            else:
+                console.print(
+                    "[bold yellow]⚠️ 没有足够历史可压缩；后续工具输出仍会受到硬上限保护。[/bold yellow]\n"
+                )
         # ===================================================
 
         self.turn_count += 1
@@ -2029,7 +2230,22 @@ class ChatAgent:
 
         for _loop in range(CONFIG.max_turns):
             # ── 流式调用模型 ──────────────────────────────
-            stream_text, final_response = await self._stream_request(on_token=on_token, cancel_event=cancel_event)
+            try:
+                stream_text, final_response = await self._stream_request(on_token=on_token, cancel_event=cancel_event)
+            except asyncio.CancelledError:
+                self.task_state.mark_blocked("用户取消了模型生成")
+                self.task_next_steps = ["使用 /resume 继续当前任务，或重新提交请求"]
+                self._persist_workspace_task()
+                task = self.workspace_state.load_task() or self._task_snapshot()
+                self.workspace_state.checkpoint("model-generation-cancelled", task)
+                raise
+            except RuntimeError as exc:
+                self.task_state.mark_blocked(f"模型服务异常：{str(exc)[:300]}")
+                self.task_next_steps = ["检查网络或上游服务后使用 /resume 重试"]
+                self._persist_workspace_task()
+                task = self.workspace_state.load_task() or self._task_snapshot()
+                self.workspace_state.checkpoint("model-service-failure", task)
+                raise
             response_text = stream_text or _extract_response_text(final_response)
             visible_text = _strip_tool_call_blocks(_strip_think(response_text))
 
@@ -2119,11 +2335,19 @@ class ChatAgent:
                         for item in output_items
                         if isinstance(item, dict)
                     ]
-                    raise RuntimeError(
+                    reason = (
                         "中转站返回了空响应：没有文本，也没有可识别的工具调用。"
                         f" status={status}, output_types={item_types}. "
                         "请临时设置 CODEX_DEBUG_REQUESTS=true 查看协议摘要。"
                     )
+                    # SSE 在中途断开时可能不会抛出 HTTP 异常，而是以空流结束。
+                    # 这同样是可恢复的服务故障，必须进入账本而不能丢失任务状态。
+                    self.task_state.mark_blocked(f"模型服务异常：{reason[:300]}")
+                    self.task_next_steps = ["检查网络或上游服务后使用 /resume 重试"]
+                    self._persist_workspace_task()
+                    task = self.workspace_state.load_task() or self._task_snapshot()
+                    self.workspace_state.checkpoint("model-service-empty-response", task)
+                    raise RuntimeError(reason)
 
                 # 关键门禁：如果代码已修改但未验证，强制要求验证
                 if self.task_state.dirty and not self.task_state.can_finish():
@@ -2190,27 +2414,81 @@ class ChatAgent:
                 if on_tool_call:
                     await on_tool_call(name, args)
 
-                success, output = await self.executor.execute(name, args)
+                if name == "verify_task":
+                    acceptance_items = _normalize_acceptance_items(args.get("acceptance_items", []))
+                    self.task_state.ensure_acceptance_items(acceptance_items)
+
+                retry_key = f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
+                attempt_count = self._tool_failure_attempts.get(retry_key, 0)
+                if attempt_count >= CONFIG.tool_retry_budget:
+                    success = False
+                    output = (
+                        f"❌ 工具重试预算已耗尽（{CONFIG.tool_retry_budget} 次）：{name}。"
+                        "请检查已记录的失败证据，改用不同参数、不同工具，或报告阻塞原因。"
+                    )
+                    self.executor.last_raw_output = output
+                    self.task_state.mark_blocked(output)
+                else:
+                    # 保持对旧扩展/测试桩的两参数 execute() 兼容；
+                    # 真实取消场景才传入取消事件。
+                    if cancel_event is None:
+                        success, output = await self.executor.execute(name, args)
+                    else:
+                        success, output = await self.executor.execute(name, args, cancel_event=cancel_event)
+                    if success:
+                        self._tool_failure_attempts.pop(retry_key, None)
+                    else:
+                        attempt_count += 1
+                        self._tool_failure_attempts[retry_key] = attempt_count
+                        category = _classify_tool_failure(output)
+                        self.failure_events.append({
+                            "tool": name,
+                            "category": category,
+                            "attempt": str(attempt_count),
+                            "summary": output[:500],
+                        })
+                        if attempt_count >= CONFIG.tool_retry_budget:
+                            self.task_state.mark_blocked(
+                                f"{name} 连续失败 {attempt_count} 次（{category}）"
+                            )
+                self.workspace_state.record_observation(
+                    name, args, success, self.executor.last_raw_output or output
+                )
+                if output.startswith("__CANCELLED__"):
+                    self.task_state.mark_blocked("用户取消了正在执行的工具")
+                    self.task_next_steps = ["检查部分输出与工作区状态后使用 /resume 决定是否重试"]
+                    self._persist_workspace_task()
+                    task = self.workspace_state.load_task() or self._task_snapshot()
+                    self.workspace_state.checkpoint("tool-cancelled", task)
+                    raise asyncio.CancelledError("用户取消了工具调用")
 
                 # 特殊处理 verify_task：只要验证通过（success=True），立即放行门禁
                 if name == "verify_task" and success:
                     # 关键修复：不再检查输出字符串，只要 success=True 就认为验证通过
                     # 这样可以避免因输出格式不匹配导致的无限循环
                     self.task_state.mark_verified(True)
-                    # 自动将所有验收项标记为已完成，防止门禁继续拦截
-                    if self.task_state.acceptance_items:
-                        for i in range(1, len(self.task_state.acceptance_items) + 1):
-                            self.task_state.completed_items.add(i)
-                    else:
+                    if not self.task_state.acceptance_items:
                         # 没有验收项时，添加虚拟标记，确保 can_finish() 返回 True
                         self.task_state.completed_items.add(0)
+                    self.task_next_steps = []
                 
                 # 特殊处理 update_task_contract：记录验收项
                 if name == "update_task_contract" and success:
                     # 从参数中提取验收项并设置到任务状态
-                    items = args.get("acceptance_items", [])
+                    items = _normalize_acceptance_items(args.get("acceptance_items", []))
                     if items:
                         self.task_state.set_acceptance_items(items)
+                    self.task_goal = str(args.get("goal", self.task_goal))
+                    self.task_next_steps = ["完成验收项并运行 verify_task"]
+
+                if name == "complete_acceptance_item" and success:
+                    index = int(args.get("index", 0))
+                    if 1 <= index <= len(self.task_state.acceptance_items):
+                        self.task_state.mark_item_completed(index)
+                        self.acceptance_evidence[str(index)] = str(args.get("evidence", ""))
+
+                if name == "verify_task":
+                    self.task_next_steps = [] if success else ["检查验证失败输出并修复后重试"]
 
                 # 跟踪文件修改（用于任务状态）
                 write_tools = ["write_file", "search_replace", "insert_lines", "delete_lines", "replace_lines", "apply_patch"]
@@ -2270,6 +2548,14 @@ class ChatAgent:
             # 更新任务状态：如果有文件被修改
             if modified_files:
                 self.task_state.mark_modified(modified_files)
+                self.task_next_steps = ["检查修改并执行验证"]
+            self._persist_workspace_task()
+            if modified_files:
+                task = self.workspace_state.load_task() or self._task_snapshot()
+                self.workspace_state.checkpoint("changes-applied", task)
+            if name == "verify_task" and success:
+                task = self.workspace_state.load_task() or self._task_snapshot()
+                self.workspace_state.checkpoint("verification-passed", task)
 
             # 如果用户拒绝了操作，直接结束这轮对话，让 AI 给用户回复空间
             if user_rejected:
@@ -2367,6 +2653,111 @@ async def handle_builtin(cmd: str, agent: ChatAgent) -> bool:
             console.print(f"工作目录: [cyan]{new_dir}[/cyan]")
         else:
             console.print(f"目录不存在: {new_dir}", style="red")
+        return True
+
+    if command == "/tasks":
+        task = agent.workspace_state.load_task()
+        if not task:
+            console.print("[dim]没有持久化的活动任务。[/dim]")
+        else:
+            console.print(Panel(
+                f"ID: {task.get('task_id', 'unknown')}\n"
+                f"目标: {task.get('goal', '未记录')}\n"
+                f"状态: {task.get('status', 'unknown')}\n"
+                f"已改文件: {', '.join(task.get('changed_files', [])) or '无'}\n"
+                f"阻塞: {task.get('block_reason') or '无'}\n"
+                f"失败记录: {len(task.get('failure_events', []))}\n"
+                f"下一步: {'；'.join(task.get('next_steps', [])) or '无'}\n"
+                f"更新时间: {task.get('updated_at', 'unknown')}",
+                title="📌 活动工程任务", border_style="cyan"
+            ))
+        return True
+
+    if command == "/checkpoint":
+        agent._persist_workspace_task()
+        task = agent.workspace_state.load_task() or agent._task_snapshot()
+        checkpoint = agent.workspace_state.checkpoint(arg or "manual", task)
+        console.print(Panel(
+            f"检查点: {checkpoint['id']}\nGit HEAD: {checkpoint.get('git_head') or '非 Git 仓库'}\n"
+            f"工作区改动:\n{checkpoint.get('git_status') or '干净'}",
+            title="✅ 已保存检查点", border_style="green"
+        ))
+        return True
+
+    if command == "/handoff":
+        agent._persist_workspace_task()
+        task = agent.workspace_state.load_task() or agent._task_snapshot()
+        path = agent.workspace_state.write_handoff(task)
+        console.print(Panel(
+            f"已生成交接报告：{path}\n"
+            "报告包含目标、验收证据、修改文件、下一步、Git 检查点和最近工具证据。",
+            title="🤝 任务交接", border_style="green"
+        ))
+        return True
+
+    if command == "/task":
+        action = arg.strip().lower()
+        if action not in {"done", "cancel"}:
+            console.print("[yellow]用法: /task done 或 /task cancel[/yellow]")
+            return True
+        if action == "done" and not agent.can_archive_task():
+            console.print(
+                "[red]任务尚不能归档：需要完成所有验收项并通过 verify_task。"
+                "可使用 /tasks、/recall 和 /checkpoint 查看证据。[/red]"
+            )
+            return True
+        agent._persist_workspace_task()
+        task = agent.workspace_state.load_task() or agent._task_snapshot()
+        status = "completed" if action == "done" else "cancelled"
+        agent.workspace_state.write_handoff(task)
+        archive = agent.workspace_state.archive_task(task, status)
+        agent.reset()
+        console.print(Panel(
+            f"任务已{ '完成归档' if status == 'completed' else '取消归档' }：{archive}\n"
+            "交接报告保留在 .mcodex/handoff.md。",
+            title="📦 任务归档", border_style="green" if status == "completed" else "yellow"
+        ))
+        return True
+
+    if command == "/resume":
+        agent.input_items = [agent.system_item]
+        agent.task_state.reset()
+        agent.task_goal = ""
+        agent.memory_summary = ""
+        agent.task_next_steps = []
+        agent.acceptance_evidence = {}
+        agent._restore_workspace_task()
+        console.print("[green]已从本地任务账本恢复。使用 /tasks 查看状态。[/green]")
+        return True
+
+    if command == "/recall":
+        if not arg:
+            console.print("[yellow]用法: /recall <关键词>[/yellow]")
+            return True
+        results = agent.workspace_state.search_observations(arg)
+        if not results:
+            console.print("[dim]未找到匹配的本地工具证据。[/dim]")
+        else:
+            body = "\n\n".join(
+                f"[{item['id']}] {item['tool']} · {'成功' if item['success'] else '失败'} · {item['timestamp']}\n{item['excerpt']}"
+                for item in results
+            )
+            console.print(Panel(body, title=f"🔎 本地证据：{arg}", border_style="magenta"))
+        return True
+
+    if command == "/worktree":
+        if not arg:
+            console.print("[yellow]用法: /worktree <名称>[/yellow]")
+            return True
+        try:
+            path, branch = agent.workspace_state.create_worktree(arg)
+            console.print(Panel(
+                f"分支: {branch}\n目录: {path}\n\n"
+                "已创建隔离工作区；请在该目录重新启动 mcodex，或使用 /cd 切换后执行 /resume。",
+                title="🌿 已创建 Git worktree", border_style="green"
+            ))
+        except ValueError as exc:
+            console.print(f"[red]无法创建 worktree：{exc}[/red]")
         return True
 
     if command == "/approve":
