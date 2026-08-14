@@ -1,8 +1,8 @@
 param(
     [string]$BaseUrl = "http://112.111.7.91:7980/v1",
-    [string]$Model = "Qwen/Qwen3.5-397B-A17B-FP8",
+    [string]$Model = "DeepSeek-V4-Flash-0731",
     [ValidateSet("native", "prompt", "hybrid")]
-    [string]$ToolTransport = "native",
+    [string]$ToolTransport = "prompt",
     [Parameter(ValueFromRemainingArguments=$true)]
     [string[]]$Arguments
 )

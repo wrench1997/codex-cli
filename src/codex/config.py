@@ -58,7 +58,7 @@ def _env(name: str, default: str) -> str:
 @dataclass
 class Config:
     api_base: str = field(default_factory=lambda: _env("CODEX_API_BASE", "http://127.0.0.1:8080/v1"))
-    model: str = field(default_factory=lambda: _env("CODEX_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8"))
+    model: str = field(default_factory=lambda: _env("CODEX_MODEL", "DeepSeek-V4-Flash-0731"))
     api_key: str = field(default_factory=lambda: _env("CODEX_API_KEY", "dummy"))
     temperature: float = field(default_factory=lambda: float(_env("CODEX_TEMPERATURE", "0.6")))
     max_turns: int = field(default_factory=lambda: int(_env("CODEX_MAX_TURNS", "50")))

@@ -57,7 +57,7 @@ UPSTREAM_API_BASE = _normalize_openai_api_base(UPSTREAM_BASE_URL)
 UPSTREAM_CHAT_URL = f"{UPSTREAM_API_BASE}/chat/completions"
 UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY") or os.getenv("VLLM_API_KEY", "")
 MODEL_NAME = os.getenv("UPSTREAM_MODEL") or os.getenv(
-    "MODEL_NAME", "Qwen/Qwen3.5-397B-A17B-FP8"
+    "MODEL_NAME", "DeepSeek-V4-Flash-0731"
 )
 
 # Keep the old public variable for code/scripts that import it.
@@ -109,8 +109,8 @@ def fetch_metrics(url):
 def extract_metric(metrics_text, metric_name, label_value=None):
     """
     正则匹配 Prometheus 格式数据，支持 label 过滤
-    例如：vllm:gpu_prefix_cache_hit_rate{model="Qwen/Qwen3.5-397B-A17B-FP8"} 0.452
-    或：vllm:prefix_cache_hits_total{engine="0",model_name="Qwen/Qwen3.5-397B-A17B-FP8"} 102432.0
+    例如：vllm:gpu_prefix_cache_hit_rate{model="DeepSeek-V4-Flash-0731"} 0.452
+    或：vllm:prefix_cache_hits_total{engine="0",model_name="DeepSeek-V4-Flash-0731"} 102432.0
     """
     if label_value:
         # 带 label 过滤的匹配

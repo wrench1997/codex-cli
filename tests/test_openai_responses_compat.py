@@ -900,6 +900,74 @@ def test_end_to_end_chat_completions_prompt_roundtrip(tmp_path):
     assert any("<tool_response>" in str(message.get("content", "")) for message in requests[1]["messages"])
 
 
+def test_chat_empty_sse_retries_once_without_streaming(tmp_path):
+    import asyncio
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format, *_args):
+            return
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            requests.append(body)
+            if body.get("stream"):
+                raw = (
+                    'data: {"id":"chatcmpl_empty","object":"chat.completion.chunk",'
+                    '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+                    '"finish_reason":"stop"}]}\n\n'
+                    "data: [DONE]\n\n"
+                ).encode()
+                content_type = "text/event-stream"
+            else:
+                raw = json.dumps({
+                    "id": "chatcmpl_retry",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "你好！"},
+                        "finish_reason": "stop",
+                    }],
+                }, ensure_ascii=False).encode("utf-8")
+                content_type = "application/json"
+
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        agent = ChatAgent(
+            str(tmp_path),
+            api_base=f"http://127.0.0.1:{server.server_port}/v1",
+            model="gpt-test",
+            agent_mode=True,
+        )
+        agent.api_mode = "chat"
+        agent._resolved_api_mode = "chat"
+        agent.tool_transport = "prompt"
+        agent.add_user("你好")
+
+        text, response = asyncio.run(agent._stream_request())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert text == "你好！"
+    assert response["output"][0]["content"][0]["text"] == "你好！"
+    assert [request["stream"] for request in requests] == [True, False]
+
+
 def test_agent_refusal_is_corrected_and_retried(tmp_path):
     import asyncio
 

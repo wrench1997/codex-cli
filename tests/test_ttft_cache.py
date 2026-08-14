@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 base_url = os.getenv("VLLM_BASE_URL")
-model_name = os.getenv("MODEL_NAME", "Qwen/Qwen3.5-397B-A17B-FP8")
+model_name = os.getenv("MODEL_NAME", "DeepSeek-V4-Flash-0731")
 
 if not base_url:
     raise ValueError("❌ 错误：未在 .env 中找到 VLLM_BASE_URL")

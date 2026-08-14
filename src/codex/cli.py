@@ -1908,6 +1908,7 @@ class ChatAgent:
             final_response: Optional[dict] = None
             completed_items: dict[int, dict] = {}
             chat_calls: dict[int, dict] = {}
+            saw_stream_done = False
 
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
@@ -1991,6 +1992,7 @@ class ChatAgent:
                                     continue
                                 data = line[5:].strip()
                                 if data == "[DONE]":
+                                    saw_stream_done = True
                                     break
                                 try:
                                     evt = json.loads(data)
@@ -2156,6 +2158,43 @@ class ChatAgent:
                             await on_token(final_text)
 
                 output_items = (final_response or {}).get("output", []) or []
+                if mode == "chat" and saw_stream_done and not output_items:
+                    # Some vLLM/model combinations accept Chat Completions SSE but
+                    # finish it without any content delta.  The same request often
+                    # works through the non-streaming response path, so retry once
+                    # before treating the model service as empty.  No local tool has
+                    # been executed at this point, making this retry side-effect free.
+                    retry_payload = self._build_responses_payload(mode, stream=False)
+                    self._debug_request_payload(retry_payload, mode)
+                    async with httpx.AsyncClient(timeout=120) as retry_client:
+                        retry_resp = await retry_client.post(
+                            _endpoint_for_mode(self.api_base, mode),
+                            json=retry_payload,
+                            headers=headers,
+                        )
+                    if retry_resp.status_code >= 400:
+                        raise RuntimeError(
+                            "Chat 流式响应为空，非流式重试失败："
+                            f"HTTP {retry_resp.status_code}: {retry_resp.text[:1000]}"
+                        )
+                    try:
+                        retry_data = retry_resp.json()
+                    except json.JSONDecodeError as e:
+                        raise RuntimeError(
+                            "Chat 流式响应为空，非流式重试也未返回有效 JSON："
+                            + retry_resp.text[:500]
+                        ) from e
+                    if isinstance(retry_data, dict) and retry_data.get("error"):
+                        raise RuntimeError(json.dumps(retry_data["error"], ensure_ascii=False))
+
+                    final_response = _chat_response_to_responses(retry_data)
+                    output_items = (final_response or {}).get("output", []) or []
+                    retry_text = _extract_response_text(final_response)
+                    if retry_text:
+                        stream_parts.append(retry_text)
+                        if on_token:
+                            await on_token(retry_text)
+
                 if (
                     self.api_mode == "auto"
                     and self._resolved_api_mode is None

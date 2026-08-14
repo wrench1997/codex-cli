@@ -15,8 +15,12 @@ PowerShell：
 ```powershell
 .\scripts\mcodex-vllm.ps1 `
   -BaseUrl "http://112.111.7.91:7980/v1" `
-  -Model "Qwen/Qwen3.5-397B-A17B-FP8"
+  -Model "DeepSeek-V4-Flash-0731"
 ```
+
+该直连启动器默认使用 `prompt` 工具协议，因此不要求 vLLM 服务端启用
+`--enable-auto-tool-choice` 或配置 `--tool-call-parser`。只有服务端已经按模型
+配置好原生工具解析器时，才显式传入 `-ToolTransport native`。
 
 等价命令：
 
@@ -25,7 +29,7 @@ $env:CODEX_ENV_OVERRIDE="false"
 mcodex `
   --api "http://112.111.7.91:7980/v1" `
   --api-mode chat `
-  --model "Qwen/Qwen3.5-397B-A17B-FP8" `
+  --model "DeepSeek-V4-Flash-0731" `
   --tool-transport prompt
 ```
 
@@ -84,7 +88,7 @@ UPSTREAM_MODEL="gpt-5-5"
 ```powershell
 uv run python scripts/test_api_compat.py `
   --base "http://112.111.7.91:7980" `
-  --model "Qwen/Qwen3.5-397B-A17B-FP8"
+  --model "DeepSeek-V4-Flash-0731"
 ```
 
 测试本地 Gateway：
@@ -92,7 +96,7 @@ uv run python scripts/test_api_compat.py `
 ```powershell
 uv run python scripts/test_api_compat.py `
   --base "http://127.0.0.1:8080" `
-  --model "Qwen/Qwen3.5-397B-A17B-FP8"
+  --model "DeepSeek-V4-Flash-0731"
 ```
 
 ## 关键兼容修复

@@ -33,5 +33,5 @@ This only proves that the endpoint was unreachable from the build environment. I
 ```powershell
 uv run python scripts/test_api_compat.py `
   --base "http://112.111.7.91:7980" `
-  --model "Qwen/Qwen3.5-397B-A17B-FP8"
+  --model "DeepSeek-V4-Flash-0731"
 ```

@@ -76,7 +76,7 @@ cp .env.example .env
 ```env
 CODEX_API_BASE=http://127.0.0.1:8080/v1
 CODEX_API_MODE=chat
-CODEX_MODEL=Qwen/Qwen3.5-397B-A17B-FP8
+CODEX_MODEL=DeepSeek-V4-Flash-0731
 CODEX_API_KEY=your-api-key
 CODEX_TEMPERATURE=0.6
 ```
@@ -355,7 +355,7 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8080
 | `CODEX_TOOL_TRANSPORT` | `prompt` | `native` 原生工具；`prompt` 本地文本工具协议；`hybrid` 同时启用 |
 | `CODEX_TOOL_CHOICE` | `auto` | 原生 Responses 工具选择策略 |
 | `CODEX_DEBUG_REQUESTS` | `false` | 输出请求模式、工具数量和输入项类型 |
-| `CODEX_MODEL` | `Qwen/Qwen3.5-397B-A17B-FP8` | 模型名称 |
+| `CODEX_MODEL` | `DeepSeek-V4-Flash-0731` | 模型名称 |
 | `CODEX_API_KEY` | `dummy` | API 密钥 |
 | `CODEX_TEMPERATURE` | `0.6` | 采样温度 |
 | `CODEX_MAX_TURNS` | `50` | 最大工具调用轮次 |
