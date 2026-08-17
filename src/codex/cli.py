@@ -378,6 +378,24 @@ MCODEX_JSON_CALL_RE = re.compile(
 )
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(?P<body>\{.*\})\s*```$", re.S | re.I)
 
+# DeepSeek 模型会使用 <｜DSML｜invoke name="..."> 格式输出工具调用，
+# 其中 ｜ 是全角竖线 (U+FF5C)。兼容全角和半角竖线。
+_PIPE = r"[｜|]"
+DSML_INVOKE_RE = re.compile(
+    r"<" + _PIPE + r"DSML" + _PIPE + r"invoke\s+name=[\"']?(?P<name>[^\"'\s>]+)[\"']?\s*>"
+    r"(?P<body>.*?)</" + _PIPE + r"DSML" + _PIPE + r"invoke>",
+    re.S,
+)
+DSML_PARAM_RE = re.compile(
+    r"<" + _PIPE + r"DSML" + _PIPE + r"parameter\s+name=[\"']?(?P<name>[^\"'\s>]+)[\"']?[^>]*>"
+    r"\s*(?P<value>.*?)\s*</" + _PIPE + r"DSML" + _PIPE + r"parameter>",
+    re.S,
+)
+DSML_BLOCK_RE = re.compile(
+    r"<" + _PIPE + r"DSML" + _PIPE + r"tool_calls?>.*?</" + _PIPE + r"DSML" + _PIPE + r"tool_calls?>",
+    re.S,
+)
+
 
 def _strip_think(text: str) -> str:
     return THINK_RE.sub("", text).strip()
@@ -881,6 +899,29 @@ def _parse_tool_calls(text: str) -> list[dict]:
             "_mcodex_transport": "prompt",
         })
 
+    # DeepSeek <｜DSML｜invoke> 格式。
+    offset = len(calls)
+    for index, match in enumerate(DSML_INVOKE_RE.finditer(source), start=offset):
+        name = match.group("name").strip()
+        body = match.group("body")
+        args: dict[str, Any] = {}
+        for param in DSML_PARAM_RE.finditer(body):
+            raw = param.group("value").strip()
+            try:
+                args[param.group("name").strip()] = json.loads(raw)
+            except json.JSONDecodeError:
+                args[param.group("name").strip()] = raw
+
+        suffix = f"{int(time.time() * 1000)}_{index}"
+        calls.append({
+            "type": "function_call",
+            "id": f"fc_dsml_{suffix}",
+            "call_id": f"call_dsml_{suffix}",
+            "name": name,
+            "arguments": json.dumps(args, ensure_ascii=False),
+            "_mcodex_transport": "prompt",
+        })
+
     # 少数中转站会去掉外层标签，只留下完整 JSON 调用对象。
     if not calls:
         candidate = _strip_think(source).strip()
@@ -916,7 +957,9 @@ def _parse_tool_calls(text: str) -> list[dict]:
 def _strip_tool_call_blocks(text: str) -> str:
     """移除完整工具调用块，只保留给用户看的自然语言。"""
     cleaned = MCODEX_JSON_CALL_RE.sub("", text or "")
-    return TOOL_CALL_RE.sub("", cleaned).strip()
+    cleaned = TOOL_CALL_RE.sub("", cleaned)
+    cleaned = DSML_BLOCK_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def _parse_tool_call(text: str) -> Optional[dict]:
@@ -1678,6 +1721,8 @@ class ChatAgent:
                 payload["tool_choice"] = CONFIG.tool_choice
             if CONFIG.send_temperature:
                 payload["temperature"] = CONFIG.temperature
+            if CONFIG.max_output_tokens > 0:
+                payload["max_tokens"] = CONFIG.max_output_tokens
             return payload
 
         payload = {
@@ -1892,8 +1937,15 @@ class ChatAgent:
         self,
         on_token: Any = None,
         cancel_event: Any = None,
+        on_stream_reset: Any = None,
     ) -> tuple[str, Optional[dict]]:
-        """调用 OpenAI 兼容接口，统一返回内部 Responses 形态。"""
+        """调用 OpenAI 兼容接口，统一返回内部 Responses 形态。
+
+        当流式连接被远端中断（如 "incomplete chunked read"、"peer closed
+        connection"）时自动重试。重试前调用 on_stream_reset 重置 UI 渲染器，
+        避免部分输出和新输出拼接到一起。当前 turn 内尚未执行任何工具时重试
+        是安全且无副作用的。
+        """
         headers = {"Accept": "text/event-stream"}
         if CONFIG.api_key and CONFIG.api_key != "dummy":
             headers["Authorization"] = f"Bearer {CONFIG.api_key}"
@@ -1904,325 +1956,380 @@ class ChatAgent:
         for mode in self._candidate_api_modes():
             payload = self._build_responses_payload(mode, stream=True)
             self._debug_request_payload(payload, mode)
-            stream_parts: list[str] = []
-            final_response: Optional[dict] = None
-            completed_items: dict[int, dict] = {}
-            chat_calls: dict[int, dict] = {}
-            saw_stream_done = False
 
-            try:
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream(
-                        "POST",
-                        _endpoint_for_mode(self.api_base, mode),
-                        json=payload,
-                        headers=headers,
-                    ) as resp:
-                        if resp.status_code >= 400:
-                            raw_error = await resp.aread()
-                            error_text = raw_error.decode("utf-8", errors="replace")
-                            last_http_error = f"HTTP {resp.status_code}: {error_text[:1000]}"
-                            if (
-                                self.api_mode == "auto"
-                                and self._resolved_api_mode is None
-                                and resp.status_code in fallback_statuses
-                                and mode != "gateway"
-                            ):
-                                next_mode = "Chat Completions" if mode == "responses" else "旧 gateway"
-                                console.print(
-                                    f"[yellow]⚠️ {mode} 协议被当前服务拒绝，自动尝试 {next_mode}。[/yellow]"
-                                )
-                                continue
-                            raise RuntimeError(last_http_error)
+            # ── 连接级重试循环 ──────────────────────────────
+            # 仅对 httpx.HTTPError（连接中断、读取失败等）重试；
+            # HTTP 4xx/5xx 和空响应通过 RuntimeError 直接抛出，不重试。
+            try_next_mode = False
+            stream_succeeded = False
 
-                        content_type = resp.headers.get("content-type", "").lower()
-                        if "text/event-stream" not in content_type:
-                            raw = await resp.aread()
-                            try:
-                                data = json.loads(raw.decode("utf-8"))
-                            except json.JSONDecodeError as e:
-                                raise RuntimeError(
-                                    "接口未返回 SSE，也不是有效 JSON："
-                                    + raw.decode("utf-8", errors="replace")[:500]
-                                ) from e
+            for attempt in range(CONFIG.stream_retry_count + 1):
+                stream_parts: list[str] = []
+                final_response: Optional[dict] = None
+                completed_items: dict[int, dict] = {}
+                chat_calls: dict[int, dict] = {}
+                saw_stream_done = False
+                saw_finish_reason = False
+                was_sse = False
 
-                            if isinstance(data, dict) and data.get("error"):
-                                raise RuntimeError(json.dumps(data["error"], ensure_ascii=False))
-
-                            final_response = (
-                                _chat_response_to_responses(data)
-                                if isinstance(data, dict) and "choices" in data
-                                else data
-                            )
-                            text = _extract_response_text(final_response)
-                            if text:
-                                stream_parts.append(text)
-                                if on_token:
-                                    await on_token(text)
-                        else:
-                            line_iterator = resp.aiter_lines()
-                            line_task: Optional[asyncio.Task] = None
-                            while True:
-                                if cancel_event and cancel_event.is_set():
-                                    # 不在 wait_for() 的取消清理路径中等待远端关闭；
-                                    # 某些反向代理会一直挂起该读取。让 HTTP 客户端在退出
-                                    # 上下文时回收连接，同时立即把控制权还给 Esc。
-                                    network_stream = resp.extensions.get("network_stream")
-                                    if network_stream is not None:
-                                        close = getattr(network_stream, "aclose", None)
-                                        if close is not None:
-                                            await close()
-                                    if line_task and not line_task.done():
-                                        line_task.cancel()
-                                    raise asyncio.CancelledError("用户取消了生成")
-                                if line_task is None:
-                                    line_task = asyncio.create_task(line_iterator.__anext__())
-                                done, _pending = await asyncio.wait({line_task}, timeout=0.2)
-                                if not done:
-                                    # 服务暂时不发 token 时也能响应 Esc。
-                                    continue
-                                try:
-                                    line = line_task.result()
-                                except StopAsyncIteration:
-                                    break
-                                finally:
-                                    line_task = None
-
-                                if not line or not line.startswith("data:"):
-                                    continue
-                                data = line[5:].strip()
-                                if data == "[DONE]":
-                                    saw_stream_done = True
-                                    break
-                                try:
-                                    evt = json.loads(data)
-                                except json.JSONDecodeError:
-                                    continue
-                                if not isinstance(evt, dict):
-                                    continue
-
-                                # Chat Completions SSE: choices[].delta.content/tool_calls
-                                if mode == "chat" and isinstance(evt.get("choices"), list):
-                                    for choice in evt.get("choices") or []:
-                                        if not isinstance(choice, dict):
-                                            continue
-                                        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-                                        content = _content_to_text(delta.get("content", ""))
-                                        if content:
-                                            stream_parts.append(content)
-                                            if on_token:
-                                                await on_token(content)
-
-                                        delta_calls = delta.get("tool_calls") or []
-                                        if isinstance(delta.get("function_call"), dict):
-                                            delta_calls = [{
-                                                "index": 0,
-                                                "id": delta["function_call"].get("id"),
-                                                "function": delta["function_call"],
-                                            }]
-
-                                        for raw_call in delta_calls:
-                                            if not isinstance(raw_call, dict):
-                                                continue
-                                            try:
-                                                index = int(raw_call.get("index", 0))
-                                            except (TypeError, ValueError):
-                                                index = 0
-                                            fn = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
-                                            call = chat_calls.setdefault(index, {
-                                                "type": "function_call",
-                                                "id": raw_call.get("id") or f"fc_chat_stream_{index}",
-                                                "call_id": raw_call.get("id") or f"call_chat_stream_{index}",
-                                                "name": "",
-                                                "arguments": "",
-                                            })
-                                            if raw_call.get("id"):
-                                                call["id"] = raw_call["id"]
-                                                call["call_id"] = raw_call["id"]
-                                            if fn.get("name"):
-                                                call["name"] = fn["name"]
-                                            arguments_delta = fn.get("arguments")
-                                            if isinstance(arguments_delta, str):
-                                                call["arguments"] = str(call.get("arguments", "")) + arguments_delta
-                                    continue
-
-                                etype = evt.get("type", "")
-                                if etype == "response.output_text.delta":
-                                    delta = evt.get("delta", "")
-                                    if isinstance(delta, str) and delta:
-                                        stream_parts.append(delta)
-                                        if on_token:
-                                            await on_token(delta)
-
-                                elif etype in {"response.output_item.added", "response.output_item.done"}:
-                                    item = evt.get("item")
-                                    index = evt.get("output_index", len(completed_items))
-                                    if isinstance(item, dict):
-                                        try:
-                                            completed_items[int(index)] = dict(item)
-                                        except (TypeError, ValueError):
-                                            completed_items[len(completed_items)] = dict(item)
-
-                                elif etype in {
-                                    "response.function_call_arguments.delta",
-                                    "response.function_call_arguments.done",
-                                }:
-                                    try:
-                                        index = int(evt.get("output_index", 0))
-                                    except (TypeError, ValueError):
-                                        index = 0
-                                    item = completed_items.setdefault(index, {
-                                        "type": "function_call",
-                                        "id": evt.get("item_id") or evt.get("id"),
-                                        "call_id": evt.get("call_id"),
-                                        "name": evt.get("name", ""),
-                                        "arguments": "",
-                                    })
-                                    if evt.get("item_id") and not item.get("id"):
-                                        item["id"] = evt["item_id"]
-                                    if evt.get("call_id"):
-                                        item["call_id"] = evt["call_id"]
-                                    if evt.get("name"):
-                                        item["name"] = evt["name"]
-                                    if etype.endswith(".delta"):
-                                        delta = evt.get("delta", "")
-                                        if isinstance(delta, str):
-                                            item["arguments"] = str(item.get("arguments", "")) + delta
-                                    else:
-                                        arguments = evt.get("arguments")
-                                        if isinstance(arguments, str):
-                                            item["arguments"] = arguments
-
-                                elif etype in {"response.failed", "response.incomplete", "error"}:
-                                    response_error = evt.get("response")
-                                    if isinstance(response_error, dict):
-                                        response_error = response_error.get("error") or response_error.get("incomplete_details")
-                                    err = evt.get("error") or response_error or evt
-                                    raise RuntimeError(
-                                        json.dumps(err, ensure_ascii=False)
-                                        if isinstance(err, dict) else str(err)
+                try:
+                    timeout = None
+                    if CONFIG.stream_read_timeout > 0:
+                        timeout = httpx.Timeout(
+                            connect=30.0,
+                            read=CONFIG.stream_read_timeout,
+                            write=30.0,
+                            pool=30.0,
+                        )
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        async with client.stream(
+                            "POST",
+                            _endpoint_for_mode(self.api_base, mode),
+                            json=payload,
+                            headers=headers,
+                        ) as resp:
+                            if resp.status_code >= 400:
+                                raw_error = await resp.aread()
+                                error_text = raw_error.decode("utf-8", errors="replace")
+                                last_http_error = f"HTTP {resp.status_code}: {error_text[:1000]}"
+                                if (
+                                    self.api_mode == "auto"
+                                    and self._resolved_api_mode is None
+                                    and resp.status_code in fallback_statuses
+                                    and mode != "gateway"
+                                ):
+                                    next_mode = "Chat Completions" if mode == "responses" else "旧 gateway"
+                                    console.print(
+                                        f"[yellow]⚠️ {mode} 协议被当前服务拒绝，自动尝试 {next_mode}。[/yellow]"
                                     )
+                                    try_next_mode = True
+                                    break
+                                raise RuntimeError(last_http_error)
 
-                                elif etype == "response.completed":
-                                    response_obj = evt.get("response")
-                                    if isinstance(response_obj, dict):
-                                        final_response = response_obj
+                            content_type = resp.headers.get("content-type", "").lower()
+                            if "text/event-stream" not in content_type:
+                                raw = await resp.aread()
+                                try:
+                                    data = json.loads(raw.decode("utf-8"))
+                                except json.JSONDecodeError as e:
+                                    raise RuntimeError(
+                                        "接口未返回 SSE，也不是有效 JSON："
+                                        + raw.decode("utf-8", errors="replace")[:500]
+                                    ) from e
 
-                streamed_text = "".join(stream_parts)
-                if mode == "chat":
-                    output: list[dict] = []
-                    if streamed_text:
+                                if isinstance(data, dict) and data.get("error"):
+                                    raise RuntimeError(json.dumps(data["error"], ensure_ascii=False))
+
+                                final_response = (
+                                    _chat_response_to_responses(data)
+                                    if isinstance(data, dict) and "choices" in data
+                                    else data
+                                )
+                                text = _extract_response_text(final_response)
+                                if text:
+                                    stream_parts.append(text)
+                                    if on_token:
+                                        await on_token(text)
+                            else:
+                                was_sse = True
+                                line_iterator = resp.aiter_lines()
+                                line_task: Optional[asyncio.Task] = None
+                                while True:
+                                    if cancel_event and cancel_event.is_set():
+                                        network_stream = resp.extensions.get("network_stream")
+                                        if network_stream is not None:
+                                            close = getattr(network_stream, "aclose", None)
+                                            if close is not None:
+                                                await close()
+                                        if line_task and not line_task.done():
+                                            line_task.cancel()
+                                        raise asyncio.CancelledError("用户取消了生成")
+                                    if line_task is None:
+                                        line_task = asyncio.create_task(line_iterator.__anext__())
+                                    done, _pending = await asyncio.wait({line_task}, timeout=0.2)
+                                    if not done:
+                                        continue
+                                    try:
+                                        line = line_task.result()
+                                    except StopAsyncIteration:
+                                        break
+                                    finally:
+                                        line_task = None
+
+                                    if not line or not line.startswith("data:"):
+                                        continue
+                                    data = line[5:].strip()
+                                    if data == "[DONE]":
+                                        saw_stream_done = True
+                                        break
+                                    try:
+                                        evt = json.loads(data)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    if not isinstance(evt, dict):
+                                        continue
+
+                                    # Chat Completions SSE: choices[].delta.content/tool_calls
+                                    if mode == "chat" and isinstance(evt.get("choices"), list):
+                                        for choice in evt.get("choices") or []:
+                                            if not isinstance(choice, dict):
+                                                continue
+                                            if choice.get("finish_reason"):
+                                                saw_finish_reason = True
+                                            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                                            content = _content_to_text(delta.get("content", ""))
+                                            if content:
+                                                stream_parts.append(content)
+                                                if on_token:
+                                                    await on_token(content)
+
+                                            delta_calls = delta.get("tool_calls") or []
+                                            if isinstance(delta.get("function_call"), dict):
+                                                delta_calls = [{
+                                                    "index": 0,
+                                                    "id": delta["function_call"].get("id"),
+                                                    "function": delta["function_call"],
+                                                }]
+
+                                            for raw_call in delta_calls:
+                                                if not isinstance(raw_call, dict):
+                                                    continue
+                                                try:
+                                                    index = int(raw_call.get("index", 0))
+                                                except (TypeError, ValueError):
+                                                    index = 0
+                                                fn = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
+                                                call = chat_calls.setdefault(index, {
+                                                    "type": "function_call",
+                                                    "id": raw_call.get("id") or f"fc_chat_stream_{index}",
+                                                    "call_id": raw_call.get("id") or f"call_chat_stream_{index}",
+                                                    "name": "",
+                                                    "arguments": "",
+                                                })
+                                                if raw_call.get("id"):
+                                                    call["id"] = raw_call["id"]
+                                                    call["call_id"] = raw_call["id"]
+                                                if fn.get("name"):
+                                                    call["name"] = fn["name"]
+                                                arguments_delta = fn.get("arguments")
+                                                if isinstance(arguments_delta, str):
+                                                    call["arguments"] = str(call.get("arguments", "")) + arguments_delta
+                                        continue
+
+                                    etype = evt.get("type", "")
+                                    if etype == "response.output_text.delta":
+                                        delta = evt.get("delta", "")
+                                        if isinstance(delta, str) and delta:
+                                            stream_parts.append(delta)
+                                            if on_token:
+                                                await on_token(delta)
+
+                                    elif etype in {"response.output_item.added", "response.output_item.done"}:
+                                        item = evt.get("item")
+                                        index = evt.get("output_index", len(completed_items))
+                                        if isinstance(item, dict):
+                                            try:
+                                                completed_items[int(index)] = dict(item)
+                                            except (TypeError, ValueError):
+                                                completed_items[len(completed_items)] = dict(item)
+
+                                    elif etype in {
+                                        "response.function_call_arguments.delta",
+                                        "response.function_call_arguments.done",
+                                    }:
+                                        try:
+                                            index = int(evt.get("output_index", 0))
+                                        except (TypeError, ValueError):
+                                            index = 0
+                                        item = completed_items.setdefault(index, {
+                                            "type": "function_call",
+                                            "id": evt.get("item_id") or evt.get("id"),
+                                            "call_id": evt.get("call_id"),
+                                            "name": evt.get("name", ""),
+                                            "arguments": "",
+                                        })
+                                        if evt.get("item_id") and not item.get("id"):
+                                            item["id"] = evt["item_id"]
+                                        if evt.get("call_id"):
+                                            item["call_id"] = evt["call_id"]
+                                        if evt.get("name"):
+                                            item["name"] = evt["name"]
+                                        if etype.endswith(".delta"):
+                                            delta = evt.get("delta", "")
+                                            if isinstance(delta, str):
+                                                item["arguments"] = str(item.get("arguments", "")) + delta
+                                        else:
+                                            arguments = evt.get("arguments")
+                                            if isinstance(arguments, str):
+                                                item["arguments"] = arguments
+
+                                    elif etype in {"response.failed", "response.incomplete", "error"}:
+                                        response_error = evt.get("response")
+                                        if isinstance(response_error, dict):
+                                            response_error = response_error.get("error") or response_error.get("incomplete_details")
+                                        err = evt.get("error") or response_error or evt
+                                        raise RuntimeError(
+                                            json.dumps(err, ensure_ascii=False)
+                                            if isinstance(err, dict) else str(err)
+                                        )
+
+                                    elif etype == "response.completed":
+                                        response_obj = evt.get("response")
+                                        if isinstance(response_obj, dict):
+                                            final_response = response_obj
+
+                    # ── 不完整流检测 ──────────────────────────────
+                    # vLLM 在连接中断时可能不抛 HTTPError，而是直接关闭流，
+                    # 导致 aiter_lines() 以 StopAsyncIteration 结束。
+                    # 仅当收到了部分数据（stream_parts 非空）且没有收到
+                    # [DONE]（chat）或 response.completed（responses）时才重试；
+                    # 完全空的流由 run_turn 的空响应检测处理。
+                    if was_sse and mode == "chat" and not saw_stream_done and not saw_finish_reason and stream_parts:
+                        raise httpx.HTTPError(
+                            "流式响应未收到 [DONE] 或 finish_reason，疑似连接中断"
+                        )
+                    if was_sse and mode != "chat" and final_response is None and stream_parts:
+                        raise httpx.HTTPError(
+                            "流式响应未收到 response.completed，疑似连接中断"
+                        )
+
+                    # 流式请求成功完成，退出重试循环
+                    stream_succeeded = True
+                    break
+
+                except asyncio.CancelledError:
+                    raise
+                except httpx.HTTPError as e:
+                    if attempt < CONFIG.stream_retry_count:
+                        if on_stream_reset:
+                            on_stream_reset()
+                        delay = CONFIG.stream_retry_delay * (2 ** attempt)
+                        console.print(
+                            f"\n[yellow]⚠️ 流式连接中断（{e}），"
+                            f"第 {attempt + 1}/{CONFIG.stream_retry_count} 次重试"
+                            f"（等待 {delay:.1f}s）...[/yellow]"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    raise RuntimeError(f"请求 OpenAI 兼容 API 失败：{e}") from e
+
+            # HTTP 状态码触发了模式切换，跳到下一个 API 模式
+            if try_next_mode:
+                continue
+            # 连接重试全部耗尽且未成功（理论上不会走到这里，因为最后一次会抛异常）
+            if not stream_succeeded:
+                continue
+
+            streamed_text = "".join(stream_parts)
+            if mode == "chat":
+                output: list[dict] = []
+                if streamed_text:
+                    output.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": streamed_text}],
+                    })
+                output.extend(chat_calls[index] for index in sorted(chat_calls))
+                if final_response is None or "choices" in final_response:
+                    final_response = {
+                        "object": "response",
+                        "status": "completed",
+                        "output": output,
+                    }
+                elif output and not final_response.get("output"):
+                    final_response["output"] = output
+            else:
+                # Responses/gateway SSE 事件合并。
+                final_response = _merge_stream_output_items(final_response, completed_items)
+
+                if streamed_text and not _extract_response_text(final_response):
+                    output = final_response.setdefault("output", [])
+                    message_item = next(
+                        (
+                            item for item in output
+                            if isinstance(item, dict) and item.get("type") == "message"
+                        ),
+                        None,
+                    )
+                    if message_item is None:
                         output.append({
                             "type": "message",
                             "role": "assistant",
                             "status": "completed",
                             "content": [{"type": "output_text", "text": streamed_text}],
                         })
-                    output.extend(chat_calls[index] for index in sorted(chat_calls))
-                    if final_response is None or "choices" in final_response:
-                        final_response = {
-                            "object": "response",
-                            "status": "completed",
-                            "output": output,
-                        }
-                    elif output and not final_response.get("output"):
-                        final_response["output"] = output
-                else:
-                    # Responses/gateway SSE 事件合并。
-                    final_response = _merge_stream_output_items(final_response, completed_items)
+                    elif not message_item.get("content"):
+                        message_item["content"] = [{"type": "output_text", "text": streamed_text}]
 
-                    if streamed_text and not _extract_response_text(final_response):
-                        output = final_response.setdefault("output", [])
-                        message_item = next(
-                            (
-                                item for item in output
-                                if isinstance(item, dict) and item.get("type") == "message"
-                            ),
-                            None,
-                        )
-                        if message_item is None:
-                            output.append({
-                                "type": "message",
-                                "role": "assistant",
-                                "status": "completed",
-                                "content": [{"type": "output_text", "text": streamed_text}],
-                            })
-                        elif not message_item.get("content"):
-                            message_item["content"] = [{"type": "output_text", "text": streamed_text}]
+            if not stream_parts:
+                final_text = _extract_response_text(final_response)
+                if final_text:
+                    stream_parts.append(final_text)
+                    if on_token:
+                        await on_token(final_text)
 
-                if not stream_parts:
-                    final_text = _extract_response_text(final_response)
-                    if final_text:
-                        stream_parts.append(final_text)
-                        if on_token:
-                            await on_token(final_text)
-
-                output_items = (final_response or {}).get("output", []) or []
-                if mode == "chat" and saw_stream_done and not output_items:
-                    # Some vLLM/model combinations accept Chat Completions SSE but
-                    # finish it without any content delta.  The same request often
-                    # works through the non-streaming response path, so retry once
-                    # before treating the model service as empty.  No local tool has
-                    # been executed at this point, making this retry side-effect free.
-                    retry_payload = self._build_responses_payload(mode, stream=False)
-                    self._debug_request_payload(retry_payload, mode)
-                    async with httpx.AsyncClient(timeout=120) as retry_client:
-                        retry_resp = await retry_client.post(
-                            _endpoint_for_mode(self.api_base, mode),
-                            json=retry_payload,
-                            headers=headers,
-                        )
-                    if retry_resp.status_code >= 400:
-                        raise RuntimeError(
-                            "Chat 流式响应为空，非流式重试失败："
-                            f"HTTP {retry_resp.status_code}: {retry_resp.text[:1000]}"
-                        )
-                    try:
-                        retry_data = retry_resp.json()
-                    except json.JSONDecodeError as e:
-                        raise RuntimeError(
-                            "Chat 流式响应为空，非流式重试也未返回有效 JSON："
-                            + retry_resp.text[:500]
-                        ) from e
-                    if isinstance(retry_data, dict) and retry_data.get("error"):
-                        raise RuntimeError(json.dumps(retry_data["error"], ensure_ascii=False))
-
-                    final_response = _chat_response_to_responses(retry_data)
-                    output_items = (final_response or {}).get("output", []) or []
-                    retry_text = _extract_response_text(final_response)
-                    if retry_text:
-                        stream_parts.append(retry_text)
-                        if on_token:
-                            await on_token(retry_text)
-
-                if (
-                    self.api_mode == "auto"
-                    and self._resolved_api_mode is None
-                    and mode != "gateway"
-                    and not output_items
-                ):
-                    last_http_error = f"{mode} 返回空 output"
-                    continue
-
-                if CONFIG.debug_requests:
-                    normalized_calls = _normalize_native_tool_calls(output_items)
-                    console.print(
-                        "[dim]DEBUG response: "
-                        f"mode={mode}, streamed_chars={len(streamed_text)}, "
-                        f"event_items={len(completed_items) + len(chat_calls)}, "
-                        f"final_items={len(output_items)}, "
-                        f"tool_calls={len(normalized_calls)}, "
-                        f"status={(final_response or {}).get('status')}[/dim]"
+            output_items = (final_response or {}).get("output", []) or []
+            if mode == "chat" and saw_stream_done and not output_items:
+                # Some vLLM/model combinations accept Chat Completions SSE but
+                # finish it without any content delta.  The same request often
+                # works through the non-streaming response path, so retry once
+                # before treating the model service as empty.  No local tool has
+                # been executed at this point, making this retry side-effect free.
+                retry_payload = self._build_responses_payload(mode, stream=False)
+                self._debug_request_payload(retry_payload, mode)
+                async with httpx.AsyncClient(timeout=120) as retry_client:
+                    retry_resp = await retry_client.post(
+                        _endpoint_for_mode(self.api_base, mode),
+                        json=retry_payload,
+                        headers=headers,
                     )
+                if retry_resp.status_code >= 400:
+                    raise RuntimeError(
+                        "Chat 流式响应为空，非流式重试失败："
+                        f"HTTP {retry_resp.status_code}: {retry_resp.text[:1000]}"
+                    )
+                try:
+                    retry_data = retry_resp.json()
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(
+                        "Chat 流式响应为空，非流式重试也未返回有效 JSON："
+                        + retry_resp.text[:500]
+                    ) from e
+                if isinstance(retry_data, dict) and retry_data.get("error"):
+                    raise RuntimeError(json.dumps(retry_data["error"], ensure_ascii=False))
 
-                self._resolved_api_mode = mode
-                self._last_request_mode = mode
-                return "".join(stream_parts), final_response
+                final_response = _chat_response_to_responses(retry_data)
+                output_items = (final_response or {}).get("output", []) or []
+                retry_text = _extract_response_text(final_response)
+                if retry_text:
+                    stream_parts.append(retry_text)
+                    if on_token:
+                        await on_token(retry_text)
 
-            except asyncio.CancelledError:
-                raise
-            except httpx.HTTPError as e:
-                raise RuntimeError(f"请求 OpenAI 兼容 API 失败：{e}") from e
+            if (
+                self.api_mode == "auto"
+                and self._resolved_api_mode is None
+                and mode != "gateway"
+                and not output_items
+            ):
+                last_http_error = f"{mode} 返回空 output"
+                continue
+
+            if CONFIG.debug_requests:
+                normalized_calls = _normalize_native_tool_calls(output_items)
+                console.print(
+                    "[dim]DEBUG response: "
+                    f"mode={mode}, streamed_chars={len(streamed_text)}, "
+                    f"event_items={len(completed_items) + len(chat_calls)}, "
+                    f"final_items={len(output_items)}, "
+                    f"tool_calls={len(normalized_calls)}, "
+                    f"status={(final_response or {}).get('status')}[/dim]"
+                )
+
+            self._resolved_api_mode = mode
+            self._last_request_mode = mode
+            return "".join(stream_parts), final_response
 
         raise RuntimeError(last_http_error or "OpenAI 兼容 API 请求失败")
 
@@ -2235,6 +2342,7 @@ class ChatAgent:
         on_tool_result: Any = None,   # async callback(name, success, output)
         on_pending: Any = None,       # async callback(path_line, diff_text) -> tuple[bool, Optional[str]]
         cancel_event: Any = None,     # asyncio.Event - 用于取消生成
+        on_stream_reset: Any = None,  # callback() - 流式连接重试前重置渲染器
     ) -> str:
         """
         执行一个完整的对话轮次。
@@ -2270,7 +2378,11 @@ class ChatAgent:
         for _loop in range(CONFIG.max_turns):
             # ── 流式调用模型 ──────────────────────────────
             try:
-                stream_text, final_response = await self._stream_request(on_token=on_token, cancel_event=cancel_event)
+                stream_text, final_response = await self._stream_request(
+                    on_token=on_token,
+                    cancel_event=cancel_event,
+                    on_stream_reset=on_stream_reset,
+                )
             except asyncio.CancelledError:
                 self.task_state.mark_blocked("用户取消了模型生成")
                 self.task_next_steps = ["使用 /resume 继续当前任务，或重新提交请求"]
@@ -3231,6 +3343,11 @@ async def _process_message(
     async def on_pending(path_line: str, diff_text: str) -> tuple[bool, Optional[str]]:
         return await ask_approval(path_line, diff_text)
 
+    def on_stream_reset():
+        """流式连接重试前重置渲染器，避免部分输出和新输出拼接到一起。"""
+        renderer.finish()
+        renderer.reset()
+
     try:
         # 启动后台任务监听 Esc 键
         esc_listener_task = asyncio.create_task(listen_for_esc())
@@ -3241,6 +3358,7 @@ async def _process_message(
             on_tool_result=on_tool_result,
             on_pending=on_pending,
             cancel_event=cancel_event,
+            on_stream_reset=on_stream_reset,
         )
 
         # 生成完成，停止监听

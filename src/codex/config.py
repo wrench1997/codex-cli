@@ -94,6 +94,15 @@ class Config:
     # read_file 默认分页，模型可用 start_line/end_line 继续读取后续内容。
     max_read_file_lines: int = field(default_factory=lambda: int(_env("CODEX_MAX_READ_FILE_LINES", "400")))
     tool_retry_budget: int = field(default_factory=lambda: int(_env("CODEX_TOOL_RETRY_BUDGET", "3")))
+    # 流式连接中断时的自动重试次数（如 "incomplete chunked read"、"peer closed connection"）。
+    # 在当前 turn 内尚未执行任何工具时重试是安全且无副作用的。
+    stream_retry_count: int = field(default_factory=lambda: int(_env("CODEX_STREAM_RETRY_COUNT", "3")))
+    stream_retry_delay: float = field(default_factory=lambda: float(_env("CODEX_STREAM_RETRY_DELAY", "1.0")))
+    # 模型单次生成的最大输出 token 数。设为 0 表示不限制（由服务器决定）。
+    # 对于 vLLM 部署，显式设置可防止输出 + 输入超过 max_model_len 导致连接中断。
+    max_output_tokens: int = field(default_factory=lambda: int(_env("CODEX_MAX_OUTPUT_TOKENS", "0")))
+    # 流式读取超时（秒）。设为 0 表示不限制。超过此时间未收到任何数据时触发重试。
+    stream_read_timeout: float = field(default_factory=lambda: float(_env("CODEX_STREAM_READ_TIMEOUT", "0")))
 
     def __post_init__(self):
         aliases = {
@@ -127,10 +136,16 @@ class Config:
         for name in (
             "max_context_tokens", "context_reserve_tokens", "max_tool_output_chars",
             "max_tool_output_lines", "max_read_file_lines",
-            "tool_retry_budget",
+            "tool_retry_budget", "stream_retry_count",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} 必须是正整数")
+        if self.stream_retry_delay < 0:
+            raise ValueError("CODEX_STREAM_RETRY_DELAY 不能小于 0")
+        if self.max_output_tokens < 0:
+            raise ValueError("CODEX_MAX_OUTPUT_TOKENS 不能小于 0")
+        if self.stream_read_timeout < 0:
+            raise ValueError("CODEX_STREAM_READ_TIMEOUT 不能小于 0")
         if self.tool_choice not in {"auto", "required", "none"}:
             raise ValueError(
                 "CODEX_TOOL_CHOICE 必须是 auto、required 或 none，"
