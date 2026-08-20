@@ -5,6 +5,7 @@ import pytest
 from src.codex.cli import ChatAgent
 from src.codex.config import CONFIG
 from src.codex.tools import ToolExecutor
+from src.codex.tools import TOOLS
 
 
 def test_read_file_is_paginated_and_reports_next_page(tmp_path, monkeypatch):
@@ -169,3 +170,14 @@ def test_single_oversized_latest_message_is_rejected_before_network(tmp_path, mo
     assert not called
     assert agent.task_state.status == "blocked"
     assert "分批" in agent.task_next_steps[0]
+
+
+def test_long_file_learning_protocol_requires_pagination_and_resume():
+    read_tool = next(
+        tool for tool in TOOLS
+        if tool.get("function", {}).get("name") == "read_file"
+    )
+    description = read_tool["function"]["description"]
+    assert "完整学习" in description
+    assert "start_line=1" in description
+    assert "下一页" in description

@@ -519,6 +519,9 @@ def _build_prompt_tool_instructions(tools: list[dict]) -> str:
         "5. If you previously said you had no access or permission, that was incorrect: retry with a mcodex tool immediately.",
         "6. Inside <mcodex_tool_call>, emit pure JSON only. Never write an <arguments> tag; use the JSON key ,\"arguments\": exactly.",
         "7. The legacy <tool_call><function=...><parameter=...> format is accepted, but never mix it with mcodex JSON format.",
+        "8. When the user asks you to completely learn or understand a long file, use read_file from start_line=1 and keep following its next-page hint until no hint remains; do not claim completion after the first page.",
+        "9. For long-file learning, keep a compact progress record (path, covered line range, key symbols, dependencies, and unresolved questions) instead of retaining every raw page; reread an exact page later when needed.",
+        "10. If context compaction occurs during learning, resume from the last recorded line range and continue pagination; never silently skip the unread tail.",
     ])
     return "\n".join(lines)
 

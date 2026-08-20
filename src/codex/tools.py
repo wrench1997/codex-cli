@@ -141,7 +141,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取文件内容，支持显示行号。默认分页读取，内容较长时请用 start_line/end_line 继续读取。",
+            "description": "读取文件内容，支持显示行号和分页。用户要求完整学习/理解长文件时，必须从 start_line=1 开始按返回的下一页提示循环读取到文件末尾；每页先提炼要点，不能只读第一页就宣称已完成。",
             "parameters": {
                 "type": "object",
                 "properties": {

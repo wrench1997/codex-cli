@@ -1,16 +1,14 @@
 {
-  "goal": "完成压缩、解析、Rich 渲染与 mcodex-vllm 启动器压力验证",
+  "goal": "补齐超长文件分页学习协议与回归验证",
   "acceptance": [
-    "默认压缩不外发历史原文并完成脱敏和长度限制",
-    "归档记忆与任务账本不具备 system 指令权限",
-    "畸形参数和 Rich 方括号文本不会崩溃或误执行",
-    "mcodex-vllm.ps1 在 AllSigned 环境可进入交互界面",
-    "高次数压力和规定回归测试通过"
+    "read_file 明确要求从第一页分页到末尾",
+    "长文件学习支持压缩后按最后行号恢复",
+    "超长上下文门禁、分页和兼容性回归通过"
   ],
   "affected_files": [
-    "scripts/mcodex-vllm.ps1",
+    "src/codex/tools.py",
     "src/codex/cli.py",
-    "src/codex/config.py"
+    "tests/test_context_guardrails.py"
   ],
   "status": "implementing",
   "changed_files": [],
