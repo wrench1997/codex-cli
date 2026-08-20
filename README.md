@@ -53,6 +53,18 @@ codex-cli/
 
 ## 快速开始
 
+### 桌面版（Rust / Tauri）
+
+桌面端是 Rust/Tauri 核心工作台，仍由本仓库的 Python `ChatAgent` 执行模型调用、工具和 MCP；原有 CLI 与网关均无需替换。它通过本地 JSONL 子进程协议通信，不开放网络端口。项目中的 `.mcodex` 是 CLI 与桌面端共享的任务事实源；桌面会话保存在 `.mcodex/desktop/`，不会写入 API 地址、模型密钥等配置。
+
+```powershell
+cd desktop
+npm install
+npm run dev
+```
+
+首次启动时将“CLI 工作目录”设为本仓库根目录（开发模式默认 `..`），并确保 `python` 能启动已安装依赖的环境。工作台提供会话切换、流式执行记录、自动批准的工具改动、活动任务、检查点、交接报告和只读 Git 差异。打包 Windows 安装包使用 `npm run build`。发布包仍需要一份可用的 Python CLI 环境；本次没有把模型/工具后端迁移到 Rust，也不包含云同步、登录或独立任意命令终端。
+
 ### 1. 安装依赖
 
 ```bash

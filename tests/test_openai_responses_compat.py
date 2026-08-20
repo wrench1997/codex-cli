@@ -1,3 +1,5 @@
+import asyncio
+
 from src.codex.cli import (
     ChatAgent,
     _extract_response_text,
@@ -758,6 +760,43 @@ def test_prompt_json_tool_call_is_parsed():
     assert args == {"path": ".", "depth": 2}
     assert call_id
     assert calls[0]["_mcodex_transport"] == "prompt"
+
+
+def test_truncated_dsml_invoke_is_repaired_and_executed_as_prompt_call():
+    from src.codex.cli import _extract_function_call, _parse_tool_calls
+
+    calls = _parse_tool_calls(
+        '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="git_status">\n\n</｜DSML｜tool_calls>>>>'
+    )
+
+    assert len(calls) == 1
+    name, arguments, call_id = _extract_function_call(calls[0])
+    assert name == "git_status"
+    assert arguments == {}
+    assert call_id
+    assert calls[0]["_mcodex_transport"] == "prompt"
+
+
+def test_agent_executes_truncated_dsml_tool_call_instead_of_ending_turn(tmp_path):
+    agent = ChatAgent(str(tmp_path), agent_mode=True, auto_approve=True)
+    agent.tool_transport = "prompt"
+    responses = iter([
+        ('<｜DSML｜tool_calls><｜DSML｜invoke name="git_status">\n</｜DSML｜tool_calls>', {"output": []}),
+        ("已检查工作区。", {"output": []}),
+    ])
+    tool_events = []
+
+    async def fake_stream_request(**_kwargs):
+        return next(responses)
+
+    async def on_tool_call(name, arguments):
+        tool_events.append((name, arguments))
+
+    agent._stream_request = fake_stream_request
+    result = asyncio.run(agent.run_turn(on_tool_call=on_tool_call))
+
+    assert result == "已检查工作区。"
+    assert tool_events == [("git_status", {})]
 
 
 def test_prompt_hybrid_json_xml_arguments_is_repaired():

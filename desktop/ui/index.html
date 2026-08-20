@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>mCodex Desktop</title><link rel="stylesheet" href="style.css" /></head>
+  <body>
+    <aside class="sidebar">
+      <header><h1>Codex</h1><span id="status">正在启动</span></header>
+      <section class="project"><label>项目</label><div><input id="workdir" readonly placeholder="正在准备工作区…" /><button id="pick-project" title="选择项目文件夹">浏览</button></div><button id="connect">切换项目</button></section>
+      <section><div class="section-title"><h2>会话</h2><button id="new-session" disabled>＋</button></div><nav id="sessions"><p class="muted">启动后端以加载会话</p></nav></section>
+      <section class="task-mini"><div class="section-title"><h2>活动任务</h2><button id="resume" disabled>恢复</button></div><p id="task-goal" class="muted">暂无活动任务</p></section>
+    </aside>
+    <main>
+      <header class="topbar"><strong id="project-name">新对话</strong><span id="model-label">本地 Codex 后端</span><label class="auto"><input id="auto-approve" type="checkbox" checked /> 完全访问</label></header>
+      <section id="timeline" aria-live="polite"><article class="empty">正在启动本地 Codex 后端…</article></section>
+      <form id="composer"><textarea id="prompt" placeholder="描述要完成的工程任务…（Enter 发送，Shift+Enter 换行）" disabled></textarea><button id="stop" type="button" disabled>停止</button><button id="send" type="submit" disabled>发送</button></form>
+    </main>
+    <aside class="details">
+      <section><div class="section-title"><h2>任务详情</h2><button id="checkpoint" disabled>检查点</button></div><dl id="task-details"><dt>状态</dt><dd>未连接</dd></dl></section>
+      <section><div class="section-title"><h2>已改文件</h2><button id="show-all-diff" disabled>查看差异</button></div><nav id="changed-files"><p class="muted">尚无记录</p></nav></section>
+      <section><div class="section-title"><h2>交接</h2><button id="handoff" disabled>生成报告</button></div><p class="muted">报告写入项目内 <code>.mcodex/handoff.md</code></p></section>
+      <pre id="diff" hidden></pre>
+    </aside>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

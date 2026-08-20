@@ -6,6 +6,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
 
+import pytest
+
 from src.codex.cli import ChatAgent
 from src.codex.config import CONFIG
 from src.codex.tools import ToolExecutor
@@ -288,10 +290,37 @@ def test_silent_sse_stream_cancellation_persists_recovery_state(tmp_path):
         asyncio.run(cancel_stream())
         task = WorkspaceState(str(tmp_path)).load_task()
         assert task["status"] == "blocked"
-        assert "用户取消" in task["block_reason"]
+        assert "本地取消事件" in task["block_reason"]
         assert WorkspaceState(str(tmp_path)).checkpoint_count() >= 1
     finally:
         _stop_faulty_sse_server(server, thread)
+
+
+def test_outer_task_cancellation_is_not_misattributed_as_user_cancel(tmp_path, monkeypatch):
+    agent = ChatAgent(str(tmp_path), agent_mode=True)
+    agent.add_user("detect an external cancellation")
+
+    async def fake_stream_request(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(agent, "_stream_request", fake_stream_request)
+
+    async def cancel_outer_task():
+        task = asyncio.create_task(agent.run_turn())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_outer_task())
+
+    task = WorkspaceState(str(tmp_path)).load_task()
+    assert task["status"] == "blocked"
+    assert task["block_reason"] == "模型生成被外层任务取消（非本地 Esc）"
+    checkpoint = WorkspaceState(str(tmp_path))._recent_json_lines(
+        WorkspaceState(str(tmp_path)).checkpoints_file, 1
+    )[0]
+    assert checkpoint["label"] == "model-generation-externally-cancelled"
 
 
 def test_closed_sse_stream_marks_task_blocked_and_checkpoints(tmp_path):

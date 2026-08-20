@@ -1,0 +1,14 @@
+{
+  "name": "mcodex-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build:backend": "powershell -ExecutionPolicy Bypass -File ../scripts/build_desktop_backend.ps1",
+    "build": "npm run build:backend && tauri build --bundles msi"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

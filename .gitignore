@@ -54,3 +54,11 @@ uv.lock
 # 缓存
 .cache/
 *.cache
+
+# Rust/Tauri local build dependencies
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/resources/codex-backend.exe
+desktop/.pyinstaller-work/
+desktop/.pyinstaller-spec/
+desktop/.backend-smoke/

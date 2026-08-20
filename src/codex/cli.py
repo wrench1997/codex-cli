@@ -396,6 +396,13 @@ DSML_BLOCK_RE = re.compile(
     r"<" + _PIPE + r"DSML" + _PIPE + r"tool_calls?>.*?</" + _PIPE + r"DSML" + _PIPE + r"tool_calls?>",
     re.S,
 )
+DSML_INVOKE_OPEN_RE = re.compile(
+    r"<" + _PIPE + r"DSML" + _PIPE
+    + r"invoke\s+name=[\"']?(?P<name>[^\"'\s>]+)[\"']?\s*>",
+    re.S,
+)
+DSML_INVOKE_CLOSE_RE = re.compile(r"</" + _PIPE + r"DSML" + _PIPE + r"invoke>", re.S)
+DSML_TOOL_CALLS_CLOSE_RE = re.compile(r"</" + _PIPE + r"DSML" + _PIPE + r"tool_calls?>", re.S)
 
 
 def _strip_think(text: str) -> str:
@@ -954,6 +961,36 @@ def _parse_tool_calls(text: str) -> list[dict]:
             "type": "function_call",
             "id": f"fc_dsml_{suffix}",
             "call_id": f"call_dsml_{suffix}",
+            "name": name,
+            "arguments": json.dumps(args, ensure_ascii=False),
+            "_mcodex_transport": "prompt",
+        })
+
+    # 部分 DeepSeek/中转流会在 `</tool_calls>` 前截断 `</invoke>`。
+    # 这种情况仍然包含完整工具名，且无参数工具（例如 git_status）可以
+    # 安全执行；若有参数，已闭合的 parameter 标签仍会照常解析。
+    # 只补没有对应 invoke 闭合标签的调用，避免和上面的正常分支重复。
+    offset = len(calls)
+    open_matches = list(DSML_INVOKE_OPEN_RE.finditer(source))
+    for index, match in enumerate(open_matches, start=offset):
+        tail_end = open_matches[index - offset + 1].start() if index - offset + 1 < len(open_matches) else len(source)
+        tool_calls_close = DSML_TOOL_CALLS_CLOSE_RE.search(source, match.end(), tail_end)
+        if tool_calls_close:
+            tail_end = tool_calls_close.start()
+        body = source[match.end():tail_end]
+        if DSML_INVOKE_CLOSE_RE.search(body):
+            continue
+        name = match.group("name").strip()
+        args: dict[str, Any] = {}
+        for param in DSML_PARAM_RE.finditer(body):
+            raw = param.group("value").strip()
+            decoded = _decode_json_value(raw)
+            args[param.group("name").strip()] = raw if decoded is None else decoded
+        suffix = f"{int(time.time() * 1000)}_{index}"
+        calls.append({
+            "type": "function_call",
+            "id": f"fc_dsml_repaired_{suffix}",
+            "call_id": f"call_dsml_repaired_{suffix}",
             "name": name,
             "arguments": json.dumps(args, ensure_ascii=False),
             "_mcodex_transport": "prompt",
@@ -2483,11 +2520,23 @@ class ChatAgent:
                     on_stream_reset=on_stream_reset,
                 )
             except asyncio.CancelledError:
-                self.task_state.mark_blocked("用户取消了模型生成")
-                self.task_next_steps = ["使用 /resume 继续当前任务，或重新提交请求"]
+                user_cancelled = bool(cancel_event and cancel_event.is_set())
+                if user_cancelled:
+                    reason = "用户通过本地取消事件终止了模型生成"
+                    checkpoint_label = "model-generation-user-cancelled"
+                    next_steps = ["使用 /resume 继续当前任务，或重新提交请求"]
+                    exit_type = "本地取消（Esc/调用方 cancel_event）"
+                else:
+                    reason = "模型生成被外层任务取消（非本地 Esc）"
+                    checkpoint_label = "model-generation-externally-cancelled"
+                    next_steps = ["检查桌面桥、调用方或进程生命周期后使用 /resume 重试"]
+                    exit_type = "异常：外层任务取消"
+                console.print(f"[dim]mcodex 调试：模型生成退出 = {exit_type}。[/dim]")
+                self.task_state.mark_blocked(reason)
+                self.task_next_steps = next_steps
                 self._persist_workspace_task()
                 task = self.workspace_state.load_task() or self._task_snapshot()
-                self.workspace_state.checkpoint("model-generation-cancelled", task)
+                self.workspace_state.checkpoint(checkpoint_label, task)
                 raise
             except RuntimeError as exc:
                 self.task_state.mark_blocked(f"模型服务异常：{str(exc)[:300]}")
@@ -3392,9 +3441,9 @@ async def _process_message(
             while is_generating:
                 if msvcrt.kbhit():
                     key = msvcrt.getwch()
-                    if key == '\x1b' or key == '':  # Esc 键
+                    if key == '\x1b':  # Esc 键
                         cancel_event.set()
-                        console.print("\n[yellow]  已取消生成[/yellow]")
+                        console.print("\n[yellow]  已取消生成（本地 Esc）[/yellow]")
                         break
                 await asyncio.sleep(0.05)
         else:
@@ -3471,6 +3520,7 @@ async def _process_message(
         # 结束流式输出
         renderer.finish()
         console.print()
+        console.print("  [dim]mcodex 调试：模型生成退出 = 正常完成（已收到可用响应）。[/dim]")
 
         # 打印统计
         console.print(
@@ -3480,10 +3530,14 @@ async def _process_message(
         )
 
     except asyncio.CancelledError:
-        # 用户按 Esc 取消了生成
         renderer.finish()
         console.print()
-        console.print("  [yellow]  已取消生成（历史仍保留）[/yellow]")
+        if cancel_event.is_set():
+            console.print("  [yellow]mcodex 调试：生成退出 = 本地取消（Esc/调用方 cancel_event）。[/yellow]")
+            console.print("  [yellow]已取消生成（历史仍保留）[/yellow]")
+        else:
+            console.print("  [red]mcodex 调试：生成退出 = 异常：外层任务取消，非本地 Esc。[/red]")
+            console.print("  [red]生成被外部取消（历史仍保留）[/red]")
         # 停止监听
         is_generating = False
         # 移除最后加入的 user 消息
@@ -3495,6 +3549,7 @@ async def _process_message(
     except KeyboardInterrupt:
         renderer.finish()
         console.print()
+        console.print("  [yellow]mcodex 调试：生成退出 = 本地终端中断（Ctrl+C）。[/yellow]")
         console.print("  [yellow]  已中断生成（历史仍保留）[/yellow]")
         # 停止监听
         is_generating = False
@@ -3509,6 +3564,7 @@ async def _process_message(
     except Exception as e:
         renderer.finish()
         console.print()
+        console.print("  [red]mcodex 调试：生成退出 = 异常：模型请求或本地处理失败。[/red]")
         console.print(Panel(
             Text(str(e), style="red"),
             title=" 错误",

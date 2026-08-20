@@ -1,19 +1,22 @@
 {
-  "goal": "补齐超长文件分页学习协议与回归验证",
+  "goal": "实现 Rust Codex 核心工作台，复用外部 Python CLI 后端和 .mcodex 状态",
   "acceptance": [
-    "read_file 明确要求从第一页分页到末尾",
-    "长文件学习支持压缩后按最后行号恢复",
-    "超长上下文门禁、分页和兼容性回归通过"
+    "JSONL 桥接支持会话、取消、任务与只读差异操作",
+    "项目内桌面会话可持久化并与 CLI 任务账本共用",
+    "Rust/Tauri 生命周期与目录选择可用",
+    "三栏工作台展示会话、执行时间线、任务和改动",
+    "Python、Rust、打包验证通过并记录发布产物"
   ],
   "affected_files": [
-    "src/codex/tools.py",
-    "src/codex/cli.py",
-    "tests/test_context_guardrails.py"
+    "src/codex/desktop_bridge.py",
+    "desktop",
+    "tests"
   ],
   "status": "implementing",
   "changed_files": [],
   "verification": {
     "required": [],
     "passed": []
-  }
+  },
+  "not_in_scope": "不内置 Python、云同步、登录、插件市场和独立任意终端"
 }
