@@ -1,0 +1,21 @@
+{
+  "goal": "完成压缩、解析、Rich 渲染与 mcodex-vllm 启动器压力验证",
+  "acceptance": [
+    "默认压缩不外发历史原文并完成脱敏和长度限制",
+    "归档记忆与任务账本不具备 system 指令权限",
+    "畸形参数和 Rich 方括号文本不会崩溃或误执行",
+    "mcodex-vllm.ps1 在 AllSigned 环境可进入交互界面",
+    "高次数压力和规定回归测试通过"
+  ],
+  "affected_files": [
+    "scripts/mcodex-vllm.ps1",
+    "src/codex/cli.py",
+    "src/codex/config.py"
+  ],
+  "status": "implementing",
+  "changed_files": [],
+  "verification": {
+    "required": [],
+    "passed": []
+  }
+}

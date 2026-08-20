@@ -34,3 +34,10 @@ def test_vllm_launcher_supports_api_key_auth():
     assert "Remove-Item Env:\\CODEX_API_KEY" in script
     # The project .env must not clobber the explicitly resolved key.
     assert '$env:CODEX_ENV_OVERRIDE = "false"' in script
+
+
+def test_vllm_launcher_bypasses_nested_script_policy_for_hardened_windows_hosts():
+    script = (ROOT / "scripts" / "mcodex-vllm.ps1").read_text(encoding="utf-8")
+
+    assert '$PowerShellCommand = Get-Command pwsh' in script
+    assert '-ExecutionPolicy Bypass -File $ChildScript @Arguments' in script

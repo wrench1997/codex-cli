@@ -71,5 +71,13 @@ $env:CODEX_STREAM_RETRY_DELAY = "1.0"
 # Read timeout: if no data arrives for 120s, treat as dead connection and retry.
 $env:CODEX_STREAM_READ_TIMEOUT = "120"
 
-& (Join-Path $PSScriptRoot "mcodex.ps1") @Arguments
+$ChildScript = Join-Path $PSScriptRoot "mcodex.ps1"
+# 在企业机/加固环境中当前会话可能是 AllSigned。这个启动器是用户
+# 明确调用的本地入口，子脚本仍需显式绕过策略才能运行；不要依赖
+# 外层 powershell 的执行策略继承行为。
+$PowerShellCommand = Get-Command pwsh -ErrorAction SilentlyContinue
+if (-not $PowerShellCommand) {
+    $PowerShellCommand = Get-Command powershell.exe -ErrorAction Stop
+}
+& $PowerShellCommand.Source -NoProfile -ExecutionPolicy Bypass -File $ChildScript @Arguments
 exit $LASTEXITCODE

@@ -792,6 +792,36 @@ def test_prompt_hybrid_arguments_with_closing_tag_is_repaired():
     assert args == {"path": "api.py"}
 
 
+def test_prompt_tool_call_accepts_fenced_python_style_json_arguments():
+    from src.codex.cli import _extract_function_call, _parse_tool_calls
+
+    calls = _parse_tool_calls(
+        "<mcodex_tool_call>{'name':'read_file','arguments':{'path':'README.md',},}</mcodex_tool_call>"
+    )
+
+    assert len(calls) == 1
+    name, args, _ = _extract_function_call(calls[0])
+    assert name == "read_file"
+    assert args == {"path": "README.md"}
+
+    name, args, _ = _extract_function_call({
+        "name": "read_file",
+        "arguments": "```json\\n{'path': 'README.md',}\\n```",
+    })
+    assert name == "read_file"
+    assert args == {"path": "README.md"}
+
+
+def test_unrecoverable_prompt_tool_arguments_are_rejected_not_emptied():
+    from src.codex.cli import _parse_tool_calls
+
+    calls = _parse_tool_calls(
+        '<mcodex_tool_call>{"name":"read_file","arguments":"{not-json"}</mcodex_tool_call>'
+    )
+
+    assert calls == []
+
+
 def test_missing_tool_name_with_paths_is_repaired():
     from src.codex.cli import _extract_function_call, _repair_local_tool_call
 
@@ -966,6 +996,60 @@ def test_chat_empty_sse_retries_once_without_streaming(tmp_path):
     assert text == "你好！"
     assert response["output"][0]["content"][0]["text"] == "你好！"
     assert [request["stream"] for request in requests] == [True, False]
+
+
+def test_chat_retries_transient_gateway_status(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format, *_args):
+            return
+
+        def do_POST(self):
+            requests.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0")))))
+            if len(requests) == 1:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":{"message":"temporary upstream failure"}}')
+                return
+            raw = (
+                'data: {"id":"chatcmpl_recovered","object":"chat.completion.chunk",'
+                '"choices":[{"index":0,"delta":{"content":"recovered"},'
+                '"finish_reason":"stop"}]}\n\n'
+                "data: [DONE]\n\n"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(CONFIG, "stream_retry_count", 1)
+        monkeypatch.setattr(CONFIG, "stream_retry_delay", 0)
+        agent = ChatAgent(str(tmp_path), api_base=f"http://127.0.0.1:{server.server_port}/v1", agent_mode=True)
+        agent.api_mode = "chat"
+        agent._resolved_api_mode = "chat"
+        agent.add_user("recover after a transient error")
+
+        text, response = asyncio.run(agent._stream_request())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert text == "recovered"
+    assert response["output"][0]["content"][0]["text"] == "recovered"
+    assert len(requests) == 2
 
 
 def test_agent_refusal_is_corrected_and_retried(tmp_path):

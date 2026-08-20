@@ -103,6 +103,11 @@ class Config:
     max_output_tokens: int = field(default_factory=lambda: int(_env("CODEX_MAX_OUTPUT_TOKENS", "0")))
     # 流式读取超时（秒）。设为 0 表示不限制。超过此时间未收到任何数据时触发重试。
     stream_read_timeout: float = field(default_factory=lambda: float(_env("CODEX_STREAM_READ_TIMEOUT", "0")))
+    # 历史压缩默认只在本地进行，避免把完整旧对话再次发送给上游摘要服务。
+    # 如确实信任该服务，可显式设置为 true。
+    context_summary_remote: bool = field(default_factory=lambda: _as_bool(os.environ.get("CODEX_CONTEXT_SUMMARY_REMOTE")))
+    # 持久压缩记忆的硬上限；防止多次压缩把旧摘要滚动放大回上下文。
+    context_memory_max_chars: int = field(default_factory=lambda: int(_env("CODEX_CONTEXT_MEMORY_MAX_CHARS", "6000")))
 
     def __post_init__(self):
         aliases = {
@@ -137,6 +142,7 @@ class Config:
             "max_context_tokens", "context_reserve_tokens", "max_tool_output_chars",
             "max_tool_output_lines", "max_read_file_lines",
             "tool_retry_budget", "stream_retry_count",
+            "context_memory_max_chars",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} 必须是正整数")

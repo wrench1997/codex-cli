@@ -14,16 +14,31 @@ from src.codex.workspace_state import WorkspaceState
 
 def _start_faulty_sse_server(mode: str):
     """Start a local endpoint that either stalls or closes an SSE response."""
+    request_count = 0
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, _format, *_args):
             pass
 
         def do_POST(self):
+            nonlocal request_count
+            request_count += 1
             size = int(self.headers.get("Content-Length", "0"))
             if size:
                 self.rfile.read(size)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            if mode == "recover_after_empty_close" and request_count > 1:
+                body = (
+                    'data: {"id":"chatcmpl_recovered","object":"chat.completion.chunk",'
+                    '"choices":[{"index":0,"delta":{"content":"recovered"},'
+                    '"finish_reason":"stop"}]}\n\n'
+                    "data: [DONE]\n\n"
+                ).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if mode == "stall":
                 self.send_header("Transfer-Encoding", "chunked")
             else:
@@ -79,6 +94,7 @@ def test_agent_restores_persisted_task(tmp_path):
     assert agent.task_goal == "persist task"
     assert agent.task_state.changed_files == {"module.py"}
     assert "恢复的工程任务" in agent.input_items[-1]["content"]
+    assert agent.input_items[-1]["role"] == "user"
 
 
 def test_agent_creates_resumable_task_from_first_request(tmp_path):
@@ -290,11 +306,29 @@ def test_closed_sse_stream_marks_task_blocked_and_checkpoints(tmp_path):
             asyncio.run(agent.run_turn())
             assert False, "expected connection failure"
         except RuntimeError as exc:
-            assert "空响应" in str(exc)
+            assert "连接中断" in str(exc)
 
         task = WorkspaceState(str(tmp_path)).load_task()
         assert task["status"] == "blocked"
         assert "模型服务异常" in task["block_reason"]
         assert WorkspaceState(str(tmp_path)).checkpoint_count() >= 1
+    finally:
+        _stop_faulty_sse_server(server, thread)
+
+
+def test_empty_sse_close_retries_and_recovers(tmp_path, monkeypatch):
+    server, thread, api_base = _start_faulty_sse_server("recover_after_empty_close")
+    try:
+        monkeypatch.setattr(CONFIG, "stream_retry_count", 1)
+        monkeypatch.setattr(CONFIG, "stream_retry_delay", 0)
+        agent = ChatAgent(str(tmp_path), api_base=api_base, agent_mode=True)
+        agent.api_mode = "chat"
+        agent._resolved_api_mode = "chat"
+        agent.add_user("recover after a dropped stream")
+
+        text, response = asyncio.run(agent._stream_request())
+
+        assert text == "recovered"
+        assert response["output"][0]["content"][0]["text"] == "recovered"
     finally:
         _stop_faulty_sse_server(server, thread)
